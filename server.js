@@ -5,7 +5,7 @@ const app = express();
 app.use(express.static(__dirname));
 const PORT = process.env.PORT || 3000;
 
-// CORS
+// чтобы Railway/браузер могли дергать API
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -14,122 +14,156 @@ app.use((req, res, next) => {
   next();
 });
 
-// health
-app.get("/health", (req, res) => res.json({ ok: true }));
+// health check
+app.get("/health", (req, res) => {
+  res.json({ ok: true });
+});
 
-// главная страница
+// главная страница сайта
 app.get("/", (req, res) => {
   res.type("html").send(`
 <!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8"/>
-<meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>Проверка авто по VIN</title>
-<style>
-  body{font-family:Arial; background:#f5f6f7; padding:40px;}
-  .card{background:#fff; padding:30px; border-radius:14px; box-shadow:0 10px 25px rgba(0,0,0,.08); max-width:800px; margin:auto;}
-  input{width:100%; padding:14px; font-size:16px; border-radius:10px; border:1px solid #ddd;}
-  button{margin-top:12px; padding:14px 20px; background:#ff5a2c; color:#fff; border:none; border-radius:10px; font-size:16px; cursor:pointer;}
-  button.secondary{background:#ddd; color:#111; margin-left:10px;}
-  button:disabled{opacity:.6; cursor:not-allowed;}
-  .result{margin-top:25px; background:#fafafa; padding:20px; border-radius:12px;}
-  .row{margin:6px 0; font-size:16px;}
-  .title{font-size:26px; font-weight:700; margin-bottom:15px;}
-  .err{color:#b00020; margin-top:16px; font-weight:600;}
-  .muted{color:#666; font-size:14px; margin-top:8px;}
-</style>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Проверка авто по VIN</title>
+  <style>
+    body{font-family:Arial, sans-serif; max-width:920px; margin:40px auto; padding:0 16px;}
+    .card{border:1px solid #eee; border-radius:14px; padding:22px; box-shadow:0 6px 22px rgba(0,0,0,.06); background:#fff;}
+    input{width:100%; padding:14px; font-size:16px; border:1px solid #ddd; border-radius:10px;}
+    button{margin-top:12px; padding:14px 18px; font-size:16px; border:none; border-radius:10px; background:#ff5a2c; color:#fff; cursor:pointer;}
+    button.secondary{background:#f1f1f1; color:#111;}
+    button:disabled{opacity:.6; cursor:not-allowed;}
+    .row{display:flex; gap:10px; margin-top:12px; flex-wrap:wrap;}
+    .muted{color:#666; font-size:14px; margin-top:8px;}
+    .error{color:#b00020; background:#fff1f1; border:1px solid #ffd2d2; padding:12px; border-radius:10px; margin-top:14px; white-space:pre-wrap;}
+    .result{margin-top:16px; padding:18px; background:#fafafa; border-radius:12px; border:1px solid #eee;}
+    .title{font-size:26px; font-weight:800; margin:0 0 10px;}
+    .kv{margin:6px 0; font-size:16px;}
+    .kv b{display:inline-block; min-width:150px;}
+    .divider{height:1px; background:#e9e9e9; margin:14px 0;}
+    .loading{margin-top:14px; color:#333;}
+  </style>
 </head>
 <body>
-
-<div class="card">
   <h1>Проверка автомобиля по VIN</h1>
 
-  <input id="vin" placeholder="Введите VIN (17 символов)" maxlength="17"/>
+  <div class="card">
+    <input id="vin" placeholder="Введите VIN (17 символов)" maxlength="17" />
+    <div class="row">
+      <button id="btn" onclick="checkVin()">Проверить VIN</button>
+      <button class="secondary" onclick="clearAll()">Очистить</button>
+    </div>
+    <div class="muted">Данные берутся из вашего API. Если VIN неверный — покажем ошибку.</div>
 
-  <div>
-    <button id="btn" onclick="checkVin()">Проверить VIN</button>
-    <button class="secondary" onclick="clearAll()">Очистить</button>
+    <div id="status" class="loading" style="display:none;"></div>
+    <div id="out"></div>
   </div>
-
-  <div class="muted">Данные берутся из вашего API. Если VIN неверный — покажем ошибку.</div>
-
-  <div id="result"></div>
-</div>
 
 <script>
 function clearAll(){
-  document.getElementById("vin").value = "";
-  document.getElementById("result").innerHTML = "";
+  document.getElementById('vin').value = '';
+  document.getElementById('out').innerHTML = '';
+  document.getElementById('status').style.display = 'none';
+  document.getElementById('status').textContent = '';
 }
 
 function esc(s){
-  return String(s ?? "").replace(/[&<>"']/g, function(m){
-    return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]);
-  });
+  return String(s ?? '').replace(/[&<>"']/g, (m) => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+  }[m]));
+}
+
+function formatMileage(n){
+  if (n === null || n === undefined || n === '') return '';
+  const x = Number(n);
+  if (Number.isNaN(x)) return String(n);
+  return x.toLocaleString('ru-RU');
+}
+
+function renderCar(data){
+  // data уже "короткий" объект из /check-vin
+  const brand = esc(data.brand);
+  const model = esc(data.model);
+  const year = esc(data.year);
+
+  const equipment = esc(data.equipment);
+  const modification = esc(data.modification);
+  const mileage = esc(formatMileage(data.mileage));
+  const color = esc(data.color);
+
+  return \`
+    <div class="result">
+      <div class="title">\${brand} \${model} \${year}</div>
+
+      <div class="kv"><b>Комплектация:</b> \${equipment}</div>
+      <div class="kv"><b>Модификация:</b> \${modification}</div>
+      <div class="kv"><b>Пробег:</b> \${mileage} км</div>
+      <div class="kv"><b>Цвет:</b> \${color}</div>
+
+      <div class="divider"></div>
+      <div class="muted">Маркетинговые метрики добавим следующим шагом (просмотры/классифайды/расходы и т.д.).</div>
+    </div>
+  \`;
+}
+
+function renderError(err){
+  // err может быть строкой или объектом
+  const text = typeof err === 'string' ? err : JSON.stringify(err, null, 2);
+  return \`<div class="error">\${esc(text)}</div>\`;
 }
 
 async function checkVin(){
-  var vin = document.getElementById("vin").value.trim();
-  var btn = document.getElementById("btn");
-  var result = document.getElementById("result");
+  const vin = document.getElementById('vin').value.trim();
+  const btn = document.getElementById('btn');
+  const out = document.getElementById('out');
+  const status = document.getElementById('status');
 
+  out.innerHTML = '';
   if(!vin){
-    result.innerHTML = '<div class="err">Введите VIN</div>';
+    out.innerHTML = renderError('Введите VIN');
     return;
   }
 
   btn.disabled = true;
-  result.innerHTML = '<div class="muted">Проверяем...</div>';
+  status.style.display = 'block';
+  status.textContent = 'Запрос...';
 
   try{
-    var r = await fetch("/check-vin?vin=" + encodeURIComponent(vin));
-    var data = await r.json();
+    const r = await fetch('/check-vin?vin=' + encodeURIComponent(vin));
+    const data = await r.json();
 
-    if(!r.ok || data.error){
-      var msg = data && data.error ? data.error : "Ошибка запроса";
-      result.innerHTML = '<div class="err">Ошибка: ' + esc(msg) + '</div>';
-      btn.disabled = false;
+    // Если сервер вернул ошибку
+    if(!r.ok || data?.error){
+      status.style.display = 'none';
+      out.innerHTML = renderError(data);
       return;
     }
 
-    // красивый вывод
-    var html = '';
-    html += '<div class="result">';
-    html +=   '<div class="title">' + esc(data.brand) + ' ' + esc(data.model) + ' ' + esc(data.year) + '</div>';
-    html +=   '<div class="row"><b>Комплектация:</b> ' + esc(data.equipment) + '</div>';
-    html +=   '<div class="row"><b>Модификация:</b> ' + esc(data.modification) + '</div>';
-    html +=   '<div class="row"><b>Пробег:</b> ' + esc(data.mileage) + ' км</div>';
-    html +=   '<div class="row"><b>Цвет:</b> ' + esc(data.color) + '</div>';
-    html +=   '<br>';
-    html +=   '<div class="row"><b>Привод:</b> ' + esc(data.drive) + '</div>';
-    html +=   '<div class="row"><b>КПП:</b> ' + esc(data.gear) + '</div>';
-    html +=   '<div class="row"><b>Топливо:</b> ' + esc(data.engine) + '</div>';
-    html +=   '<div class="row"><b>Объём:</b> ' + esc(data.volume) + ' л</div>';
-    html +=   '<div class="row"><b>Мощность:</b> ' + esc(data.power) + ' л.с.</div>';
-    html += '</div>';
-
-    result.innerHTML = html;
+    status.style.display = 'none';
+    out.innerHTML = renderCar(data);
 
   }catch(e){
-    result.innerHTML = '<div class="err">Ошибка: ' + esc(e.message) + '</div>';
+    status.style.display = 'none';
+    out.innerHTML = renderError('Ошибка: ' + e.message);
+  }finally{
+    btn.disabled = false;
   }
-
-  btn.disabled = false;
 }
 </script>
-
 </body>
 </html>
 `);
 });
 
-// API: VIN
+// твой эндпоинт
 app.get("/check-vin", async (req, res) => {
   const vin = (req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ error: "VIN is required" });
 
   try {
+    // 1) токен
     const tokenResponse = await axios.post(
       "https://lk.cm.expert/oauth/token",
       new URLSearchParams({
@@ -142,6 +176,7 @@ app.get("/check-vin", async (req, res) => {
 
     const token = tokenResponse.data.access_token;
 
+    // 2) авто по VIN
     const carResponse = await axios.get(
       "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
       {
@@ -152,8 +187,8 @@ app.get("/check-vin", async (req, res) => {
 
     const car = carResponse.data;
 
-    // отдаем только нужное
-    return res.json({
+    // 3) отдаем только то, что нужно для красивого UI
+    res.json({
       brand: car.brand,
       model: car.model,
       year: car.year,
@@ -161,16 +196,24 @@ app.get("/check-vin", async (req, res) => {
       modification: car.modificationName,
       mileage: car.mileage,
       color: car.color,
+
+      // оставил в ответе как запас (UI их НЕ показывает)
       drive: car.drive,
       gear: car.gear,
       engine: car.engine,
       volume: car.volume,
       power: car.power,
     });
+
   } catch (error) {
     const status = error?.response?.status;
-    const details = error?.response?.data || error.message;
-    return res.status(500).json({ error: "API request failed", status, details });
+    const data = error?.response?.data;
+
+    res.status(status || 500).json({
+      error: "API request failed",
+      status: status || 500,
+      details: data || error.message,
+    });
   }
 });
 
