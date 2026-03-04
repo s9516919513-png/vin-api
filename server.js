@@ -1,4 +1,4 @@
-// server.js (ПОЛНАЯ ВЕРСИЯ) — просто скопируй целиком и замени файл
+// server.js — полный файл (VIN + красивый вывод + маркетинг + DEBUG, чтобы понять почему падает)
 
 const express = require("express");
 const axios = require("axios");
@@ -42,16 +42,16 @@ async function getToken() {
   return tokenResponse.data.access_token;
 }
 
-// ✅ ВАЖНО: body строго по swagger (без stockCardIds!)
+// ✅ Маркетинг + debug (чтобы увидеть точную причину 400/403/404)
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
   const body = {
     grouping: "stockCardId",
     dealerIds: [dealerId],
-    siteSource,          // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
-    startDate,           // YYYY-MM-DD
-    endDate,             // YYYY-MM-DD
+    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
+    startDate, // YYYY-MM-DD
+    endDate, // YYYY-MM-DD
   };
 
   const headers = {
@@ -76,9 +76,9 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
 // health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// диагностический роут
+// диагностический роут (чтобы понимать, что отдается именно server.js, а не статика)
 app.get("/__which", (req, res) => {
-  res.type("text").send("server.js route is working");
+  res.type("text").send("server.js route is working (NOT static index.html)");
 });
 
 // Главная (HTML)
@@ -93,24 +93,25 @@ app.get("/", (req, res) => {
     body{font-family:Arial, sans-serif; max-width:980px; margin:40px auto; padding:0 16px; background:#f4f4f4;}
     h1{font-size:44px; margin:0 0 18px;}
     .card{background:#fff; border-radius:18px; padding:26px; box-shadow:0 12px 40px rgba(0,0,0,.10);}
-    .input{width:100%; padding:16px; font-size:18px; border:1px solid #ddd; border-radius:10px; outline:none;}
+    .input{width:100%; padding:16px; font-size:18px; border:1px solid #ddd; border-radius:12px; outline:none;}
     .row{display:flex; gap:12px; margin-top:14px; flex-wrap:wrap;}
-    .btn{padding:14px 20px; font-size:16px; border:none; border-radius:10px; cursor:pointer;}
+    .btn{padding:14px 20px; font-size:16px; border:none; border-radius:12px; cursor:pointer;}
     .btn-primary{background:#ff5a2c; color:#fff;}
     .btn-secondary{background:#eee; color:#111;}
     .btn:disabled{opacity:.6; cursor:not-allowed;}
     .muted{color:#777; font-size:14px; margin-top:10px;}
     .result{margin-top:18px;}
-    .title{font-size:26px; font-weight:800; margin:8px 0 14px;}
+    .title{font-size:34px; font-weight:900; margin:10px 0 16px;}
     .grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
-    .item{border:1px solid #eee; border-radius:12px; padding:12px 14px; background:#fff;}
+    .item{border:1px solid #eee; border-radius:14px; padding:14px 16px; background:#fff;}
     .label{color:#777; font-size:13px; margin-bottom:6px;}
-    .value{font-size:16px; font-weight:700; color:#111;}
+    .value{font-size:18px; font-weight:800; color:#111;}
     .error{background:#fff2f2; border:1px solid #ffd1d1; color:#b00020; padding:12px 14px; border-radius:12px;}
     .loading{color:#555;}
     .section{margin-top:18px;}
     .section h3{margin:0 0 10px; font-size:18px;}
-    @media(max-width:720px){ .grid{grid-template-columns:1fr;} h1{font-size:34px;} }
+    pre{white-space:pre-wrap; word-break:break-word; background:#0b1020; color:#d7e1ff; padding:12px; border-radius:12px; overflow:auto;}
+    @media(max-width:720px){ .grid{grid-template-columns:1fr;} h1{font-size:34px;} .title{font-size:28px;} }
   </style>
 </head>
 <body>
@@ -153,9 +154,18 @@ function resetAll(){
 }
 
 function renderMarketing(marketing){
+  // ✅ если маркетинг не пришёл — покажем причину (status/details/request body)
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг не удалось получить';
-    return '<div class="muted">' + esc(msg) + '</div>';
+    const debug = marketing?.debug ? JSON.stringify(marketing.debug, null, 2) : null;
+
+    return \`
+      <div class="section">
+        <h3>Маркетинговая статистика</h3>
+        <div class="muted">\${esc(msg)}</div>
+        \${debug ? \`<pre style="margin-top:10px;">\${esc(debug)}</pre>\` : ''}
+      </div>
+    \`;
   }
 
   const total = marketing.total || {};
@@ -164,15 +174,15 @@ function renderMarketing(marketing){
 
   const srcLine = (k, title) => {
     const x = src[k] || {};
-    const views = (x.total && x.total.views != null) ? x.total.views : null;
-    const ch = (x.total && x.total.chats) ? x.total.chats : {};
-    const sum = (x.total && (x.total.sumWithBonusesExpenses ?? x.total.sumExpenses)) ?? null;
+    const t = x.total || {};
+    const ch = (t && t.chats) ? t.chats : {};
+    const sum = (t.sumWithBonusesExpenses ?? t.sumExpenses) ?? null;
 
     return \`
       <div class="item">
         <div class="label">\${esc(title)}</div>
         <div class="value">
-          Просмотры: \${views ?? '—'} · Чаты: \${ch.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
+          Просмотры: \${t.views ?? '—'} · Чаты: \${ch.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
         </div>
       </div>
     \`;
@@ -180,7 +190,7 @@ function renderMarketing(marketing){
 
   return \`
     <div class="section">
-      <h3>Маркетинговая статистика (последние 30 дней)</h3>
+      <h3>Маркетинговая статистика (за \${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)})</h3>
       <div class="grid">
         <div class="item">
           <div class="label">Просмотры</div>
@@ -215,7 +225,7 @@ function renderMarketing(marketing){
           \${srcLine('avito.ru', 'avito.ru')}
           \${srcLine('drom.ru', 'drom.ru')}
         </div>
-        <div class="muted">Если по источникам пусто — значит API не вернул разбивку/данных нет за период.</div>
+        <div class="muted">Если по источникам пусто — значит API не вернул разбивку или данных нет за период.</div>
       </div>
     </div>
   \`;
@@ -294,95 +304,62 @@ app.get("/check-vin", async (req, res) => {
       {
         params: { vin },
         headers: { Authorization: `Bearer ${token}` },
+        timeout: 20000,
       }
     );
 
     const c = carResponse.data || {};
 
-// 2) маркетинг за последние 30 дней
-const endDate = toISODate(new Date());
-const startDate = toISODate(addDays(new Date(), -30));
+    // 2) маркетинг за последние 30 дней
+    const endDate = toISODate(new Date());
+    const startDate = toISODate(addDays(new Date(), -30));
 
-let marketing = null;
+    let marketing = null;
 
-if (c.dealerId) {
-  const base = await fetchMarketing({
-    token,
-    dealerId: c.dealerId,
-    startDate,
-    endDate,
-    siteSource: null,
-  });
+    if (c.dealerId) {
+      const base = await fetchMarketing({
+        token,
+        dealerId: c.dealerId,
+        startDate,
+        endDate,
+        siteSource: null,
+      });
 
-  const bySource = {};
-  for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
-    bySource[s] = await fetchMarketing({
-      token,
-      dealerId: c.dealerId,
-      startDate,
-      endDate,
-      siteSource: s,
-    });
-  }
+      const bySource = {};
+      for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
+        bySource[s] = await fetchMarketing({
+          token,
+          dealerId: c.dealerId,
+          startDate,
+          endDate,
+          siteSource: s,
+        });
+      }
 
-  marketing = {
-    ok: base.ok,
-    period: { startDate, endDate },
+      marketing = {
+        ok: base.ok,
+        period: { startDate, endDate },
 
-    // если ok=true — тут будет статистика
-    total: base.ok ? (base.data?.total || null) : null,
-    stats: base.ok ? (base.data?.stats || null) : null,
+        total: base.ok ? (base.data?.total || null) : null,
+        stats: base.ok ? (base.data?.stats || null) : null,
 
-    // трафик по источникам (даже если base упал)
-    bySource: {
-      "auto.ru":  bySource["auto.ru"].ok  ? { total: bySource["auto.ru"].data?.total || null }  : null,
-      "avito.ru": bySource["avito.ru"].ok ? { total: bySource["avito.ru"].data?.total || null } : null,
-      "drom.ru":  bySource["drom.ru"].ok  ? { total: bySource["drom.ru"].data?.total || null }  : null,
-    },
+        bySource: {
+          "auto.ru": bySource["auto.ru"].ok ? { total: bySource["auto.ru"].data?.total || null } : null,
+          "avito.ru": bySource["avito.ru"].ok ? { total: bySource["avito.ru"].data?.total || null } : null,
+          "drom.ru": bySource["drom.ru"].ok ? { total: bySource["drom.ru"].data?.total || null } : null,
+        },
 
-    // ✅ ВАЖНО: вот это покажет ПОЧЕМУ падает
-    debug: {
-      base,
-      bySource,
-    },
-  };
-} else {
-  marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
-  
+        // ✅ покажем точную причину ошибки, если ok=false
+        debug: {
+          base,
+          bySource,
+        },
+      };
 
-        // по классифайдам отдельно
-        const bySourceRaw = {};
-        for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
-          try {
-            bySourceRaw[s] = await fetchMarketing({
-              token,
-              dealerId: c.dealerId,
-              startDate,
-              endDate,
-              siteSource: s,
-            });
-          } catch (_) {
-            bySourceRaw[s] = null;
-          }
-        }
-
-        marketing = {
-          ok: true,
-          total: baseData?.total || null,
-          stats: baseData?.stats || null,
-          bySource: {
-            "auto.ru": { total: bySourceRaw["auto.ru"]?.total || null, stats: bySourceRaw["auto.ru"]?.stats || null },
-            "avito.ru": { total: bySourceRaw["avito.ru"]?.total || null, stats: bySourceRaw["avito.ru"]?.stats || null },
-            "drom.ru": { total: bySourceRaw["drom.ru"]?.total || null, stats: bySourceRaw["drom.ru"]?.stats || null },
-          },
-          period: { startDate, endDate },
-        };
-      } catch (e) {
-        marketing = {
-          ok: false,
-          message: "Маркетинг не удалось получить",
-          details: e?.response?.data || e.message,
-        };
+      // если base упал — добавим человекочитаемое сообщение
+      if (!base.ok) {
+        marketing.ok = false;
+        marketing.message = "Маркетинг не удалось получить (см. debug ниже — там статус/причина)";
       }
     } else {
       marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
@@ -407,7 +384,6 @@ if (c.dealerId) {
       error: "API request failed",
       status,
       message: data?.message || data?.error || error.message,
-      details: data || null,
     });
   }
 });
