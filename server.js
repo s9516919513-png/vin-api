@@ -1,4 +1,4 @@
-// server.js — полный файл (VIN + красивый вывод + маркетинг + DEBUG)
+// server.js — VIN + красивая карточка + маркетинг (авто-подбор grouping) + debug
 
 const express = require("express");
 const axios = require("axios");
@@ -37,23 +37,26 @@ async function getToken() {
       client_id: process.env.CLIENT_ID,
       client_secret: process.env.CLIENT_SECRET,
     }),
-    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 20000 }
   );
   return tokenResponse.data.access_token;
 }
 
-// ✅ Маркетинг + debug
+/**
+ * ✅ Маркетинг: пробуем разные grouping пока API не примет.
+ * Если API принимает только periodDay — всё равно вернём total по дилеру/источнику.
+ */
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
-  // ✅ FIX: grouping должен быть "stockCard" (а не stockCardId)
-  const body = {
-    grouping: "stockCard",
-    dealerIds: [dealerId],
-    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
-    startDate,  // YYYY-MM-DD
-    endDate,    // YYYY-MM-DD
-  };
+  // кандидатные значения grouping (подбираем автоматически)
+  const GROUPINGS = [
+    "stockCar",
+    "stockCarId",
+    "stockCard",
+    "stockCardId",
+    "periodDay",
+  ];
 
   const headers = {
     Authorization: `Bearer ${token}`,
@@ -61,28 +64,50 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
     Accept: "application/json",
   };
 
-  try {
-    const r = await axios.post(url, body, { headers, timeout: 20000 });
-    return { ok: true, data: r.data, request: { url, body } };
-  } catch (e) {
-    return {
-      ok: false,
-      request: { url, body },
-      status: e?.response?.status || null,
-      details: e?.response?.data || e.message,
+  let lastErr = null;
+
+  for (const grouping of GROUPINGS) {
+    const body = {
+      grouping,
+      dealerIds: [dealerId],
+      siteSource,
+      startDate,
+      endDate,
     };
+
+    try {
+      const r = await axios.post(url, body, { headers, timeout: 20000 });
+      return { ok: true, groupingUsed: grouping, data: r.data, request: { url, body } };
+    } catch (e) {
+      lastErr = {
+        ok: false,
+        groupingTried: grouping,
+        request: { url, body },
+        status: e?.response?.status || null,
+        details: e?.response?.data || e.message,
+      };
+
+      // если причина НЕ "Invalid grouping", тогда дальше смысла нет — сразу возвращаем ошибку
+      const msg = lastErr?.details?.message;
+      if (!msg || !String(msg).toLowerCase().includes("invalid grouping")) {
+        return lastErr;
+      }
+      // иначе пробуем следующий grouping
+    }
   }
+
+  return lastErr || { ok: false, status: null, details: "Unknown error" };
 }
 
 // health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// диагностический роут
+// diagnostic
 app.get("/__which", (req, res) => {
-  res.type("text").send("server.js route is working (NOT static index.html)");
+  res.type("text").send("server.js route is working");
 });
 
-// Главная (HTML)
+// HTML
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
@@ -191,7 +216,9 @@ function renderMarketing(marketing){
   return \`
     <div class="section">
       <h3>Маркетинговая статистика (за \${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)})</h3>
-      <div class="grid">
+      <div class="muted">grouping: \${esc(marketing.groupingUsed || '—')}</div>
+
+      <div class="grid" style="margin-top:10px;">
         <div class="item">
           <div class="label">Просмотры</div>
           <div class="value">\${total.views ?? '—'}</div>
@@ -290,7 +317,7 @@ async function checkVin(){
 </html>`);
 });
 
-// VIN -> нужные поля + маркетинг
+// API: VIN -> поля + маркетинг
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ ok: false, error: "VIN is required" });
@@ -298,7 +325,7 @@ app.get("/check-vin", async (req, res) => {
   try {
     const token = await getToken();
 
-    // 1) авто по VIN
+    // авто по VIN
     const carResponse = await axios.get(
       "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
       {
@@ -310,7 +337,7 @@ app.get("/check-vin", async (req, res) => {
 
     const c = carResponse.data || {};
 
-    // 2) маркетинг за последние 30 дней
+    // период 30 дней
     const endDate = toISODate(new Date());
     const startDate = toISODate(addDays(new Date(), -30));
 
@@ -336,8 +363,10 @@ app.get("/check-vin", async (req, res) => {
         });
       }
 
+      // total берём как есть (если API умеет группировать по авто — можно будет потом уточнить)
       marketing = {
         ok: base.ok,
+        groupingUsed: base.groupingUsed || null,
         period: { startDate, endDate },
 
         total: base.ok ? (base.data?.total || null) : null,
@@ -349,18 +378,16 @@ app.get("/check-vin", async (req, res) => {
           "drom.ru": bySource["drom.ru"].ok ? { total: bySource["drom.ru"].data?.total || null } : null,
         },
 
-        debug: {
-          base,
-          bySource,
-        },
+        debug: { base, bySource },
       };
 
       if (!base.ok) {
         marketing.ok = false;
-        marketing.message = "Маркетинг не удалось получить (см. debug ниже — там статус/причина)";
+        marketing.message =
+          "Маркетинг не удалось получить (см. debug ниже — там статус/причина + grouping который пробовали)";
       }
     } else {
-      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
+      marketing = { ok: false, message: "Нет dealerId — маркетинг не запросить" };
     }
 
     return res.json({
@@ -382,6 +409,7 @@ app.get("/check-vin", async (req, res) => {
       error: "API request failed",
       status,
       message: data?.message || data?.error || error.message,
+      details: data || null,
     });
   }
 });
