@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Проверка VIN</title>
+
+<style>
+body{
+font-family:Arial;
+background:#f3f3f3;
+padding:40px;
+}
+
+.container{
+max-width:600px;
+margin:auto;
+background:white;
+padding:30px;
+border-radius:10px;
+}
+
+input{
+width:100%;
+padding:12px;
+font-size:16px;
+margin-bottom:15px;
+}
+
+button{
+padding:12px 20px;
+background:#ff5a2c;
+color:white;
+border:none;
+font-size:16px;
+cursor:pointer;
+border-radius:6px;
+}
+
+#result{
+margin-top:20px;
+white-space:pre-wrap;
+}
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+<h1>Проверка автомобиля по VIN</h1>
+
+<input id="vin" placeholder="Введите VIN">
+
+<button onclick="checkVin()">Проверить VIN</button>
+
+<div id="result"></div>
+
+</div>
+
+<script>
+
+async function checkVin(){
+
+let vin = document.getElementById("vin").value
+
+let res = await fetch(
+"https://invigorating-tenderness-production.up.railway.app/check-vin?vin="+vin
+)
+
+let data = await res.json()
+
+document.getElementById("result").innerHTML =
+JSON.stringify(data,null,2)
+
+}
+
+</script>
+
+</body>
+</html>
