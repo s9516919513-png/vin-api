@@ -1,10 +1,14 @@
-// server.js — VIN + красивая карточка + маркетинг (авто-подбор grouping) + debug
-
+// server.js
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// -------------------- базовые настройки --------------------
+const http = axios.create({
+  timeout: 20000,
+});
 
 // CORS
 app.use((req, res, next) => {
@@ -15,7 +19,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// helpers
+// -------------------- helpers --------------------
 function toISODate(d) {
   const x = new Date(d);
   const yyyy = x.getFullYear();
@@ -29,85 +33,64 @@ function addDays(date, days) {
   return d;
 }
 
+// -------------------- token cache (чтобы ускорить) --------------------
+let tokenCache = {
+  token: null,
+  expiresAt: 0,
+};
+
 async function getToken() {
-  const tokenResponse = await axios.post(
+  const now = Date.now();
+  if (tokenCache.token && now < tokenCache.expiresAt - 10_000) {
+    return tokenCache.token;
+  }
+
+  const tokenResponse = await http.post(
     "https://lk.cm.expert/oauth/token",
     new URLSearchParams({
       grant_type: "client_credentials",
       client_id: process.env.CLIENT_ID,
       client_secret: process.env.CLIENT_SECRET,
     }),
-    { headers: { "Content-Type": "application/x-www-form-urlencoded" }, timeout: 20000 }
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
   );
-  return tokenResponse.data.access_token;
+
+  const token = tokenResponse.data.access_token;
+  const expiresIn = Number(tokenResponse.data.expires_in || 3600); // сек
+  tokenCache = {
+    token,
+    expiresAt: Date.now() + expiresIn * 1000,
+  };
+
+  return token;
 }
 
-/**
- * ✅ Маркетинг: пробуем разные grouping пока API не примет.
- * Если API принимает только periodDay — всё равно вернём total по дилеру/источнику.
- */
+// -------------------- marketing API --------------------
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
+  // В swagger enum по grouping: 'periodDay' (и иногда показывают 'stockCard', но у вас он не принимается)
+  // Поэтому используем только periodDay — он у вас реально сработал.
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
-  // кандидатные значения grouping (подбираем автоматически)
-  const GROUPINGS = [
-    "stockCar",
-    "stockCarId",
-    "stockCard",
-    "stockCardId",
-    "periodDay",
-  ];
+  const body = {
+    grouping: "periodDay",
+    dealerIds: [dealerId],
+    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
+    startDate,
+    endDate,
+  };
 
   const headers = {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
-    Accept: "application/json",
   };
 
-  let lastErr = null;
-
-  for (const grouping of GROUPINGS) {
-    const body = {
-      grouping,
-      dealerIds: [dealerId],
-      siteSource,
-      startDate,
-      endDate,
-    };
-
-    try {
-      const r = await axios.post(url, body, { headers, timeout: 20000 });
-      return { ok: true, groupingUsed: grouping, data: r.data, request: { url, body } };
-    } catch (e) {
-      lastErr = {
-        ok: false,
-        groupingTried: grouping,
-        request: { url, body },
-        status: e?.response?.status || null,
-        details: e?.response?.data || e.message,
-      };
-
-      // если причина НЕ "Invalid grouping", тогда дальше смысла нет — сразу возвращаем ошибку
-      const msg = lastErr?.details?.message;
-      if (!msg || !String(msg).toLowerCase().includes("invalid grouping")) {
-        return lastErr;
-      }
-      // иначе пробуем следующий grouping
-    }
-  }
-
-  return lastErr || { ok: false, status: null, details: "Unknown error" };
+  const r = await http.post(url, body, { headers });
+  return { ok: true, data: r.data, request: { url, body } };
 }
 
-// health
+// -------------------- routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// diagnostic
-app.get("/__which", (req, res) => {
-  res.type("text").send("server.js route is working");
-});
-
-// HTML
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
@@ -119,24 +102,24 @@ app.get("/", (req, res) => {
     body{font-family:Arial, sans-serif; max-width:980px; margin:40px auto; padding:0 16px; background:#f4f4f4;}
     h1{font-size:44px; margin:0 0 18px;}
     .card{background:#fff; border-radius:18px; padding:26px; box-shadow:0 12px 40px rgba(0,0,0,.10);}
-    .input{width:100%; padding:16px; font-size:18px; border:1px solid #ddd; border-radius:12px; outline:none;}
+    .input{width:100%; padding:16px; font-size:18px; border:1px solid #ddd; border-radius:10px; outline:none;}
     .row{display:flex; gap:12px; margin-top:14px; flex-wrap:wrap;}
-    .btn{padding:14px 20px; font-size:16px; border:none; border-radius:12px; cursor:pointer;}
+    .btn{padding:14px 20px; font-size:16px; border:none; border-radius:10px; cursor:pointer;}
     .btn-primary{background:#ff5a2c; color:#fff;}
     .btn-secondary{background:#eee; color:#111;}
     .btn:disabled{opacity:.6; cursor:not-allowed;}
     .muted{color:#777; font-size:14px; margin-top:10px;}
     .result{margin-top:18px;}
-    .title{font-size:34px; font-weight:900; margin:10px 0 16px;}
+    .title{font-size:34px; font-weight:900; margin:8px 0 14px;}
     .grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
-    .item{border:1px solid #eee; border-radius:14px; padding:14px 16px; background:#fff;}
-    .label{color:#777; font-size:13px; margin-bottom:6px;}
-    .value{font-size:18px; font-weight:800; color:#111;}
+    .item{border:1px solid #eee; border-radius:14px; padding:14px 16px;}
+    .label{color:#777; font-size:13px; margin-bottom:8px;}
+    .value{font-size:20px; font-weight:900; color:#111;}
     .error{background:#fff2f2; border:1px solid #ffd1d1; color:#b00020; padding:12px 14px; border-radius:12px;}
     .loading{color:#555;}
     .section{margin-top:18px;}
-    .section h3{margin:0 0 10px; font-size:18px;}
-    pre{white-space:pre-wrap; word-break:break-word; background:#0b1020; color:#d7e1ff; padding:12px; border-radius:12px; overflow:auto;}
+    .section h3{margin:0 0 10px; font-size:22px;}
+    .sub{margin:6px 0 0; color:#666; font-size:14px;}
     @media(max-width:720px){ .grid{grid-template-columns:1fr;} h1{font-size:34px;} .title{font-size:28px;} }
   </style>
 </head>
@@ -182,27 +165,25 @@ function resetAll(){
 function renderMarketing(marketing){
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг не удалось получить';
-    const debug = marketing?.debug ? JSON.stringify(marketing.debug, null, 2) : null;
-
-    return \`
-      <div class="section">
-        <h3>Маркетинговая статистика</h3>
-        <div class="muted">\${esc(msg)}</div>
-        \${debug ? \`<pre style="margin-top:10px;">\${esc(debug)}</pre>\` : ''}
-      </div>
-    \`;
+    return '<div class="muted">' + esc(msg) + '</div>';
   }
 
   const total = marketing.total || {};
   const chats = total.chats || {};
-  const src = marketing.bySource || {};
+  const bySource = marketing.bySource || {};
 
-  const srcLine = (k, title) => {
-    const x = src[k] || {};
-    const t = x.total || {};
-    const ch = (t && t.chats) ? t.chats : {};
-    const sum = (t.sumWithBonusesExpenses ?? t.sumExpenses) ?? null;
-
+  const srcCard = (key, title) => {
+    const t = (bySource[key] && bySource[key].total) ? bySource[key].total : null;
+    if(!t) {
+      return \`
+        <div class="item">
+          <div class="label">\${esc(title)}</div>
+          <div class="value">—</div>
+        </div>
+      \`;
+    }
+    const ch = t.chats || {};
+    const sum = (t.sumWithBonusesExpenses ?? t.sumExpenses);
     return \`
       <div class="item">
         <div class="label">\${esc(title)}</div>
@@ -216,9 +197,9 @@ function renderMarketing(marketing){
   return \`
     <div class="section">
       <h3>Маркетинговая статистика (за \${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)})</h3>
-      <div class="muted">grouping: \${esc(marketing.groupingUsed || '—')}</div>
+      <div class="sub">grouping: \${esc(marketing.grouping || 'periodDay')}</div>
 
-      <div class="grid" style="margin-top:10px;">
+      <div class="grid" style="margin-top:12px;">
         <div class="item">
           <div class="label">Просмотры</div>
           <div class="value">\${total.views ?? '—'}</div>
@@ -245,12 +226,12 @@ function renderMarketing(marketing){
         </div>
       </div>
 
-      <div class="section">
+      <div class="section" style="margin-top:18px;">
         <h3>Трафик с классифайдов</h3>
         <div class="grid">
-          \${srcLine('auto.ru', 'auto.ru')}
-          \${srcLine('avito.ru', 'avito.ru')}
-          \${srcLine('drom.ru', 'drom.ru')}
+          \${srcCard('auto.ru', 'auto.ru')}
+          \${srcCard('avito.ru', 'avito.ru')}
+          \${srcCard('drom.ru', 'drom.ru')}
         </div>
         <div class="muted">Если по источникам пусто — значит API не вернул разбивку или данных нет за период.</div>
       </div>
@@ -317,7 +298,7 @@ async function checkVin(){
 </html>`);
 });
 
-// API: VIN -> поля + маркетинг
+// VIN -> нужные поля + маркетинг
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ ok: false, error: "VIN is required" });
@@ -325,69 +306,72 @@ app.get("/check-vin", async (req, res) => {
   try {
     const token = await getToken();
 
-    // авто по VIN
-    const carResponse = await axios.get(
+    // 1) авто по VIN
+    const carResponse = await http.get(
       "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
       {
         params: { vin },
         headers: { Authorization: `Bearer ${token}` },
-        timeout: 20000,
       }
     );
 
     const c = carResponse.data || {};
 
-    // период 30 дней
+    // 2) маркетинг (последние 30 дней; в swagger есть ограничение ~31 день)
     const endDate = toISODate(new Date());
     const startDate = toISODate(addDays(new Date(), -30));
 
-    let marketing = null;
+    let marketing = { ok: false, message: "Маркетинг не удалось получить" };
 
     if (c.dealerId) {
-      const base = await fetchMarketing({
-        token,
-        dealerId: c.dealerId,
-        startDate,
-        endDate,
-        siteSource: null,
+      // делаем 4 запроса параллельно, чтобы было быстрее
+      const sources = ["auto.ru", "avito.ru", "drom.ru"];
+      const tasks = [
+        fetchMarketing({ token, dealerId: c.dealerId, startDate, endDate, siteSource: null }),
+        ...sources.map((s) =>
+          fetchMarketing({ token, dealerId: c.dealerId, startDate, endDate, siteSource: s })
+        ),
+      ];
+
+      const results = await Promise.allSettled(tasks);
+
+      const base = results[0].status === "fulfilled" ? results[0].value : null;
+      const bySource = {};
+
+      sources.forEach((s, idx) => {
+        const rr = results[idx + 1];
+        if (rr.status === "fulfilled") {
+          bySource[s] = { ok: true, total: rr.value?.data?.total || null, stats: rr.value?.data?.stats || null };
+        } else {
+          bySource[s] = { ok: false, total: null, stats: null };
+        }
       });
 
-      const bySource = {};
-      for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
-        bySource[s] = await fetchMarketing({
-          token,
-          dealerId: c.dealerId,
-          startDate,
-          endDate,
-          siteSource: s,
-        });
-      }
+      if (base && base.ok) {
+        marketing = {
+          ok: true,
+          grouping: "periodDay",
+          period: { startDate, endDate },
+          total: base.data?.total || null,
+          stats: base.data?.stats || null,
+          bySource,
+        };
+      } else {
+        // покажем более понятную причину (например 400/403)
+        const reason =
+          results[0].status === "rejected"
+            ? (results[0].reason?.response?.data?.message || results[0].reason?.message || "Ошибка запроса маркетинга")
+            : "Ошибка запроса маркетинга";
 
-      // total берём как есть (если API умеет группировать по авто — можно будет потом уточнить)
-      marketing = {
-        ok: base.ok,
-        groupingUsed: base.groupingUsed || null,
-        period: { startDate, endDate },
-
-        total: base.ok ? (base.data?.total || null) : null,
-        stats: base.ok ? (base.data?.stats || null) : null,
-
-        bySource: {
-          "auto.ru": bySource["auto.ru"].ok ? { total: bySource["auto.ru"].data?.total || null } : null,
-          "avito.ru": bySource["avito.ru"].ok ? { total: bySource["avito.ru"].data?.total || null } : null,
-          "drom.ru": bySource["drom.ru"].ok ? { total: bySource["drom.ru"].data?.total || null } : null,
-        },
-
-        debug: { base, bySource },
-      };
-
-      if (!base.ok) {
-        marketing.ok = false;
-        marketing.message =
-          "Маркетинг не удалось получить (см. debug ниже — там статус/причина + grouping который пробовали)";
+        marketing = {
+          ok: false,
+          message: "Маркетинг не удалось получить",
+          details: reason,
+          period: { startDate, endDate },
+        };
       }
     } else {
-      marketing = { ok: false, message: "Нет dealerId — маркетинг не запросить" };
+      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
     }
 
     return res.json({
@@ -409,7 +393,6 @@ app.get("/check-vin", async (req, res) => {
       error: "API request failed",
       status,
       message: data?.message || data?.error || error.message,
-      details: data || null,
     });
   }
 });
