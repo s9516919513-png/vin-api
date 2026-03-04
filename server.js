@@ -374,9 +374,10 @@ app.get("/check-vin", async (req, res) => {
         }
       } catch (e) {
         marketing = {
-          ok: false,
-          message: "Маркетинг не удалось получить (проверь доступ/права в API)",
-          details: e?.response?.data || e.message,
+  ok: false,
+  message: "Маркетинг не удалось получить",
+  status: e?.response?.status || null,
+  details: e?.response?.data || e?.message || String(e),
         };
       }
     } else {
