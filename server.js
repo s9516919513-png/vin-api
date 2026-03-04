@@ -13,15 +13,82 @@ app.use((req, res, next) => {
   next();
 });
 
+// helpers
+function toISODate(d) {
+  const x = new Date(d);
+  const yyyy = x.getFullYear();
+  const mm = String(x.getMonth() + 1).padStart(2, "0");
+  const dd = String(x.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+function addDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
+}
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+async function getToken() {
+  const tokenResponse = await axios.post(
+    "https://lk.cm.expert/oauth/token",
+    new URLSearchParams({
+      grant_type: "client_credentials",
+      client_id: process.env.CLIENT_ID,
+      client_secret: process.env.CLIENT_SECRET,
+    }),
+    { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+  );
+  return tokenResponse.data.access_token;
+}
+
+async function fetchMarketing({ token, dealerId, stockCardId, startDate, endDate, siteSource = null }) {
+  // В swagger это POST /marketing-statistics/stock-cars
+  // По скрину видны: grouping, dealerIds, siteSource, startDate, endDate
+  // stockCardId (фильтр по карточке) может быть — пробуем, если не примет, fallback без него
+  const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
+
+  const baseBody = {
+    grouping: "stockCardId",
+    dealerIds: [dealerId],
+    startDate,
+    endDate,
+    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
+  };
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  // 1) пробуем с фильтром по карточке (если API поддерживает)
+  if (stockCardId) {
+    try {
+      const body = { ...baseBody, stockCardIds: [stockCardId] }; // если поле в API есть — отлично
+      const r = await axios.post(url, body, { headers });
+      return { ok: true, data: r.data };
+    } catch (e) {
+      // если API ругнулся на неизвестное поле/валидацию — пойдём без stockCardIds
+      // (не падаем, просто fallback)
+    }
+  }
+
+  // 2) fallback: без stockCardIds (может вернуть агрегат по дилеру за период)
+  const r2 = await axios.post(url, baseBody, { headers });
+  return { ok: true, data: r2.data };
+}
+
 // health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// диагностический роут: покажет, что реально отдаётся
+// диагностический роут
 app.get("/__which", (req, res) => {
   res.type("text").send("server.js route is working (NOT static index.html)");
 });
 
-// Главная страница (ТОЛЬКО HTML отсюда)
+// Главная (HTML)
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
@@ -48,6 +115,9 @@ app.get("/", (req, res) => {
     .value{font-size:16px; font-weight:700; color:#111;}
     .error{background:#fff2f2; border:1px solid #ffd1d1; color:#b00020; padding:12px 14px; border-radius:12px;}
     .loading{color:#555;}
+    .section{margin-top:18px;}
+    .section h3{margin:0 0 10px; font-size:18px;}
+    .pill{display:inline-block; padding:6px 10px; border-radius:999px; background:#f2f2f2; font-size:13px; margin-right:8px;}
     @media(max-width:720px){ .grid{grid-template-columns:1fr;} h1{font-size:34px;} }
   </style>
 </head>
@@ -79,10 +149,86 @@ function formatMileage(n){
   if(!Number.isFinite(x)) return String(n);
   return x.toLocaleString('ru-RU') + ' км';
 }
+function formatMoney(n){
+  if(n === null || n === undefined || n === '') return '—';
+  const x = Number(n);
+  if(!Number.isFinite(x)) return String(n);
+  return x.toLocaleString('ru-RU') + ' ₽';
+}
 function resetAll(){
   document.getElementById('vin').value='';
   document.getElementById('out').innerHTML='';
 }
+
+function renderMarketing(marketing){
+  if(!marketing || marketing.ok === false){
+    const msg = marketing?.message || 'Маркетинг недоступен';
+    return '<div class="muted">' + esc(msg) + '</div>';
+  }
+
+  const total = marketing.total || {};
+  const chats = total.chats || {};
+  const src = marketing.bySource || {};
+
+  const srcLine = (k, title) => {
+    const x = src[k] || {};
+    const views = (x.total && x.total.views != null) ? x.total.views : null;
+    const ch = (x.total && x.total.chats) ? x.total.chats : {};
+    const sum = (x.total && (x.total.sumWithBonusesExpenses ?? x.total.sumExpenses)) ?? null;
+
+    return \`
+      <div class="item">
+        <div class="label">\${esc(title)}</div>
+        <div class="value">
+          Просмотры: \${views ?? '—'} · Чаты: \${ch.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
+        </div>
+      </div>
+    \`;
+  };
+
+  return \`
+    <div class="section">
+      <h3>Маркетинговая статистика</h3>
+      <div class="grid">
+        <div class="item">
+          <div class="label">Просмотры</div>
+          <div class="value">\${total.views ?? '—'}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Чаты (всего / пропущено / платные)</div>
+          <div class="value">\${chats.total ?? '—'} / \${chats.missed ?? '—'} / \${chats.targeted ?? '—'}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Расходы всего (с бонусами)</div>
+          <div class="value">\${total.sumWithBonusesExpenses != null ? formatMoney(total.sumWithBonusesExpenses) : (total.sumExpenses != null ? formatMoney(total.sumExpenses) : '—')}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Расходы: размещение / звонки / чаты / тариф</div>
+          <div class="value">
+            \${total.placementExpenses != null ? formatMoney(total.placementExpenses) : '—'} /
+            \${total.callsExpenses != null ? formatMoney(total.callsExpenses) : '—'} /
+            \${total.chatsExpenses != null ? formatMoney(total.chatsExpenses) : '—'} /
+            \${total.tariffsExpenses != null ? formatMoney(total.tariffsExpenses) : '—'}
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Трафик с классифайдов</h3>
+        <div class="grid">
+          \${srcLine('auto.ru', 'auto.ru')}
+          \${srcLine('avito.ru', 'avito.ru')}
+          \${srcLine('drom.ru', 'drom.ru')}
+        </div>
+        <div class="muted">Если по источникам пусто — значит API не вернул разбивку/данных нет за период.</div>
+      </div>
+    </div>
+  \`;
+}
+
 async function checkVin(){
   const vin = document.getElementById('vin').value.trim();
   const btn = document.getElementById('btn');
@@ -128,6 +274,8 @@ async function checkVin(){
           <div class="value">\${esc(data.color || '—')}</div>
         </div>
       </div>
+
+      \${renderMarketing(data.marketing)}
     \`;
   }catch(e){
     out.innerHTML = '<div class="error">Ошибка: ' + esc(e.message) + '</div>';
@@ -140,24 +288,15 @@ async function checkVin(){
 </html>`);
 });
 
-// VIN -> нужные поля
+// VIN -> нужные поля + маркетинг
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
-  if (!vin) return res.status(400).json({ ok:false, error: "VIN is required" });
+  if (!vin) return res.status(400).json({ ok: false, error: "VIN is required" });
 
   try {
-    const tokenResponse = await axios.post(
-      "https://lk.cm.expert/oauth/token",
-      new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: process.env.CLIENT_ID,
-        client_secret: process.env.CLIENT_SECRET,
-      }),
-      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
-    );
+    const token = await getToken();
 
-    const token = tokenResponse.data.access_token;
-
+    // 1) авто по VIN
     const carResponse = await axios.get(
       "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
       {
@@ -167,6 +306,67 @@ app.get("/check-vin", async (req, res) => {
     );
 
     const c = carResponse.data || {};
+
+    // 2) маркетинг за последние 30 дней
+    const endDate = toISODate(new Date());
+    const startDate = toISODate(addDays(new Date(), -30));
+
+    let marketing = null;
+
+    // dealerId в ответе есть точно (dealerId)
+    if (c.dealerId) {
+      try {
+        // общий маркетинг (без фильтра по источнику)
+        const base = await fetchMarketing({
+          token,
+          dealerId: c.dealerId,
+          stockCardId: c.id, // пробуем как ID карточки
+          startDate,
+          endDate,
+          siteSource: null,
+        });
+
+        // по классифайдам отдельно
+        const bySource = {};
+        for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
+          try {
+            const rr = await fetchMarketing({
+              token,
+              dealerId: c.dealerId,
+              stockCardId: c.id,
+              startDate,
+              endDate,
+              siteSource: s,
+            });
+            bySource[s] = rr.data || null;
+          } catch (_) {
+            bySource[s] = null;
+          }
+        }
+
+        marketing = {
+          ok: true,
+          // некоторые API возвращают {total, stats}, мы аккуратно вытаскиваем
+          total: base?.data?.total || null,
+          stats: base?.data?.stats || null,
+          bySource: {
+            "auto.ru": { total: bySource["auto.ru"]?.total || null, stats: bySource["auto.ru"]?.stats || null },
+            "avito.ru": { total: bySource["avito.ru"]?.total || null, stats: bySource["avito.ru"]?.stats || null },
+            "drom.ru": { total: bySource["drom.ru"]?.total || null, stats: bySource["drom.ru"]?.stats || null },
+          },
+          period: { startDate, endDate },
+        };
+      } catch (e) {
+        marketing = {
+          ok: false,
+          message: "Маркетинг не удалось получить (проверь доступ/права в API)",
+          details: e?.response?.data || e.message,
+        };
+      }
+    } else {
+      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
+    }
+
     return res.json({
       ok: true,
       brand: c.brand,
@@ -176,6 +376,7 @@ app.get("/check-vin", async (req, res) => {
       modificationName: c.modificationName,
       mileage: c.mileage,
       color: c.color,
+      marketing,
     });
   } catch (error) {
     const status = error?.response?.status || 500;
