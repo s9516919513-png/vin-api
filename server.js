@@ -132,7 +132,20 @@ async function checkVin(){
 
   try{
     const r = await fetch('/check-vin?vin=' + encodeURIComponent(vin));
-    const data = await r.json();
+const data = await r.json();
+
+out.innerHTML = `
+<div style="margin-top:20px">
+
+<h2>${data.brand} ${data.model} ${data.year}</h2>
+
+<p><b>Комплектация:</b> ${data.equipment}</p>
+<p><b>Модификация:</b> ${data.modification}</p>
+<p><b>Пробег:</b> ${data.mileage} км</p>
+<p><b>Цвет:</b> ${data.color}</p>
+
+</div>
+`;
 
     // Если сервер вернул ошибку
     if(!r.ok || data?.error){
