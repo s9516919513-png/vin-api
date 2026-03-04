@@ -25,100 +25,227 @@ app.get("/", (req, res) => {
 <!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Проверка авто по VIN</title>
-  <style>
-    body{font-family:Arial, sans-serif; max-width:820px; margin:40px auto; padding:0 16px;}
-    .card{border:1px solid #eee; border-radius:14px; padding:22px; box-shadow:0 6px 22px rgba(0,0,0,.06);}
-    input{width:100%; padding:14px; font-size:16px; border:1px solid #ddd; border-radius:10px;}
-    button{margin-top:12px; padding:14px 18px; font-size:16px; border:none; border-radius:10px; background:#ff5a2c; color:#fff; cursor:pointer;}
-    button:disabled{opacity:.6; cursor:not-allowed;}
-    pre{white-space:pre-wrap; word-break:break-word; background:#0b1020; color:#d7e1ff; padding:14px; border-radius:12px; overflow:auto;}
-    .row{display:flex; gap:10px; margin-top:12px;}
-    .muted{color:#666; font-size:14px; margin-top:8px;}
-  </style>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Проверка авто по VIN</title>
+
+<style>
+
+body{
+font-family:Arial;
+background:#f5f6f7;
+padding:40px;
+}
+
+.card{
+background:white;
+padding:30px;
+border-radius:14px;
+box-shadow:0 10px 25px rgba(0,0,0,0.08);
+max-width:800px;
+margin:auto;
+}
+
+input{
+width:100%;
+padding:14px;
+font-size:16px;
+border-radius:10px;
+border:1px solid #ddd;
+}
+
+button{
+margin-top:12px;
+padding:14px 20px;
+background:#ff5a2c;
+color:white;
+border:none;
+border-radius:10px;
+font-size:16px;
+cursor:pointer;
+}
+
+button:disabled{
+opacity:.6;
+cursor:not-allowed;
+}
+
+.result{
+margin-top:25px;
+background:#fafafa;
+padding:20px;
+border-radius:12px;
+}
+
+.row{
+margin:6px 0;
+font-size:16px;
+}
+
+.title{
+font-size:26px;
+font-weight:700;
+margin-bottom:15px;
+}
+
+</style>
+
 </head>
+
 <body>
-  <h1>Проверка автомобиля по VIN</h1>
-  <div class="card">
-    <input id="vin" placeholder="Введите VIN (17 символов)" maxlength="17"/>
-    <div class="row">
-      <button id="btn" onclick="checkVin()">Проверить VIN</button>
-      <button onclick="document.getElementById('vin').value='';document.getElementById('out').textContent='';">Очистить</button>
-    </div>
-    <div class="muted">Данные берутся из вашего API. Если VIN неверный — покажем ошибку.</div>
-    <h3>Результат</h3>
-    <pre id="out"></pre>
-  </div>
+
+<div class="card">
+
+<h1>Проверка автомобиля по VIN</h1>
+
+<input id="vin" placeholder="Введите VIN (17 символов)" maxlength="17"/>
+
+<button id="btn" onclick="checkVin()">Проверить VIN</button>
+
+<div id="result"></div>
+
+</div>
 
 <script>
+
 async function checkVin(){
-  const vin = document.getElementById('vin').value.trim();
-  const btn = document.getElementById('btn');
-  const out = document.getElementById('out');
 
-  if(!vin){ out.textContent = 'Введите VIN'; return; }
+const vin = document.getElementById("vin").value.trim();
+const btn = document.getElementById("btn");
+const result = document.getElementById("result");
 
-  btn.disabled = true;
-  out.textContent = 'Запрос...';
-
-  try{
-    const r = await fetch('/check-vin?vin=' + encodeURIComponent(vin));
-    const data = await r.json();
-    out.textContent = JSON.stringify(data, null, 2);
-  }catch(e){
-    out.textContent = 'Ошибка: ' + e.message;
-  }finally{
-    btn.disabled = false;
-  }
+if(!vin){
+result.innerHTML = "Введите VIN";
+return;
 }
+
+btn.disabled = true;
+result.innerHTML = "Проверяем...";
+
+try{
+
+const r = await fetch("/check-vin?vin="+encodeURIComponent(vin));
+const data = await r.json();
+
+if(data.error){
+result.innerHTML = "Ошибка: "+data.error;
+btn.disabled = false;
+return;
+}
+
+result.innerHTML = \`
+
+<div class="result">
+
+<div class="title">
+\${data.brand} \${data.model} \${data.year}
+</div>
+
+<div class="row"><b>Комплектация:</b> \${data.equipment}</div>
+<div class="row"><b>Модификация:</b> \${data.modification}</div>
+
+<div class="row"><b>Пробег:</b> \${data.mileage} км</div>
+<div class="row"><b>Цвет:</b> \${data.color}</div>
+
+<br>
+
+<div class="row"><b>Привод:</b> \${data.drive}</div>
+<div class="row"><b>КПП:</b> \${data.gear}</div>
+<div class="row"><b>Топливо:</b> \${data.engine}</div>
+<div class="row"><b>Объём:</b> \${data.volume} л</div>
+<div class="row"><b>Мощность:</b> \${data.power} л.с.</div>
+
+</div>
+
+\`;
+
+}catch(e){
+
+result.innerHTML = "Ошибка запроса";
+
+}
+
+btn.disabled = false;
+
+}
+
 </script>
+
 </body>
 </html>
 `);
 });
 
-// твой эндпоинт
+// VIN API
 app.get("/check-vin", async (req, res) => {
-  const vin = req.query.vin;
-  if (!vin) return res.status(400).json({ error: "VIN is required" });
 
-  try {
-    const tokenResponse = await axios.post(
-      "https://lk.cm.expert/oauth/token",
-      new URLSearchParams({
-        grant_type: "client_credentials",
-        client_id: process.env.CLIENT_ID,
-        client_secret: process.env.CLIENT_SECRET,
-      }),
-      {
-        headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      }
-    );
+const vin = req.query.vin;
 
-    const token = tokenResponse.data.access_token;
+if (!vin)
+return res.status(400).json({ error: "VIN is required" });
+
+try {
+
+const tokenResponse = await axios.post(
+"https://lk.cm.expert/oauth/token",
+new URLSearchParams({
+grant_type: "client_credentials",
+client_id: process.env.CLIENT_ID,
+client_secret: process.env.CLIENT_SECRET
+}),
+{
+headers: {
+"Content-Type": "application/x-www-form-urlencoded"
+}
+}
+);
+
+const token = tokenResponse.data.access_token;
 
 const carResponse = await axios.get(
-  "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
-  {
-    params: { vin: vin },
-    headers: {
-      Authorization: `Bearer ${token}`
-    }
-  }
+"https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
+{
+params: { vin: vin },
+headers: {
+Authorization: \`Bearer \${token}\`
+}
+}
 );
-    res.json(carResponse.data);
-  } catch (error) {
-    // покажем полезнее, чем просто message
-    const status = error?.response?.status;
-    const data = error?.response?.data;
-    res.status(500).json({
-      error: "API request failed",
-      status,
-      details: data || error.message,
-    });
-  }
+
+const car = carResponse.data;
+
+// возвращаем только нужные поля
+res.json({
+
+brand: car.brand,
+model: car.model,
+year: car.year,
+
+equipment: car.equipmentName,
+modification: car.modificationName,
+
+mileage: car.mileage,
+color: car.color,
+
+drive: car.drive,
+gear: car.gear,
+engine: car.engine,
+volume: car.volume,
+power: car.power
+
 });
 
-app.listen(PORT, () => console.log("Server running on port " + PORT));
+} catch (error) {
+
+res.status(500).json({
+error: "API request failed",
+details: error?.response?.data || error.message
+});
+
+}
+
+});
+
+app.listen(PORT, () =>
+console.log("Server running on port " + PORT)
+);
