@@ -49,18 +49,28 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   const body = {
     grouping: "stockCardId",
     dealerIds: [dealerId],
-    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
-    startDate,
-    endDate,
+    siteSource,          // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
+    startDate,           // YYYY-MM-DD
+    endDate,             // YYYY-MM-DD
   };
 
   const headers = {
     Authorization: `Bearer ${token}`,
     "Content-Type": "application/json",
+    Accept: "application/json",
   };
 
-  const r = await axios.post(url, body, { headers });
-  return r.data;
+  try {
+    const r = await axios.post(url, body, { headers, timeout: 20000 });
+    return { ok: true, data: r.data, request: { url, body } };
+  } catch (e) {
+    return {
+      ok: false,
+      request: { url, body },
+      status: e?.response?.status || null,
+      details: e?.response?.data || e.message,
+    };
+  }
 }
 
 // health
@@ -289,22 +299,56 @@ app.get("/check-vin", async (req, res) => {
 
     const c = carResponse.data || {};
 
-    // 2) маркетинг за последние 30 дней
-    const endDate = toISODate(new Date());
-    const startDate = toISODate(addDays(new Date(), -30));
+// 2) маркетинг за последние 30 дней
+const endDate = toISODate(new Date());
+const startDate = toISODate(addDays(new Date(), -30));
 
-    let marketing = null;
+let marketing = null;
 
-    if (c.dealerId) {
-      try {
-        // общий маркетинг (без источника)
-        const baseData = await fetchMarketing({
-          token,
-          dealerId: c.dealerId,
-          startDate,
-          endDate,
-          siteSource: null,
-        });
+if (c.dealerId) {
+  const base = await fetchMarketing({
+    token,
+    dealerId: c.dealerId,
+    startDate,
+    endDate,
+    siteSource: null,
+  });
+
+  const bySource = {};
+  for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
+    bySource[s] = await fetchMarketing({
+      token,
+      dealerId: c.dealerId,
+      startDate,
+      endDate,
+      siteSource: s,
+    });
+  }
+
+  marketing = {
+    ok: base.ok,
+    period: { startDate, endDate },
+
+    // если ok=true — тут будет статистика
+    total: base.ok ? (base.data?.total || null) : null,
+    stats: base.ok ? (base.data?.stats || null) : null,
+
+    // трафик по источникам (даже если base упал)
+    bySource: {
+      "auto.ru":  bySource["auto.ru"].ok  ? { total: bySource["auto.ru"].data?.total || null }  : null,
+      "avito.ru": bySource["avito.ru"].ok ? { total: bySource["avito.ru"].data?.total || null } : null,
+      "drom.ru":  bySource["drom.ru"].ok  ? { total: bySource["drom.ru"].data?.total || null }  : null,
+    },
+
+    // ✅ ВАЖНО: вот это покажет ПОЧЕМУ падает
+    debug: {
+      base,
+      bySource,
+    },
+  };
+} else {
+  marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
+  
 
         // по классифайдам отдельно
         const bySourceRaw = {};
