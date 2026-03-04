@@ -1,12 +1,10 @@
-// server.js
 const express = require("express");
 const axios = require("axios");
 
 const app = express();
-app.use(express.static(__dirname));
 const PORT = process.env.PORT || 3000;
 
-// чтобы Railway/браузер могли дергать API
+// CORS
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -16,21 +14,23 @@ app.use((req, res, next) => {
 });
 
 // helpers
-function fmtInt(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-  return Number(n).toLocaleString("ru-RU");
+function toISODate(d) {
+  const x = new Date(d);
+  const yyyy = x.getFullYear();
+  const mm = String(x.getMonth() + 1).padStart(2, "0");
+  const dd = String(x.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
 }
-function fmtMoney(n) {
-  if (n === null || n === undefined || Number.isNaN(Number(n))) return "—";
-  return Number(n).toLocaleString("ru-RU") + " ₽";
+function addDays(date, days) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + days);
+  return d;
 }
-function safeStr(v) {
-  if (v === null || v === undefined) return "—";
-  const s = String(v).trim();
-  return s ? s : "—";
+function safeNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
 }
 
-// Получаем токен
 async function getToken() {
   const tokenResponse = await axios.post(
     "https://lk.cm.expert/oauth/token",
@@ -44,158 +44,193 @@ async function getToken() {
   return tokenResponse.data.access_token;
 }
 
-// Получаем последнюю оценку по VIN
-async function fetchCarByVin({ token, vin }) {
-  const carResponse = await axios.get(
-    "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
-    {
-      params: { vin },
-      headers: { Authorization: `Bearer ${token}` },
-    }
-  );
-  return carResponse.data;
-}
-
-// Маркетинговая статистика (валидное тело по swagger: grouping, dealerIds, siteSource, startDate, endDate)
-async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
+async function fetchMarketing({ token, dealerId, stockCardId, startDate, endDate, siteSource = null }) {
+  // В swagger это POST /marketing-statistics/stock-cars
+  // По скрину видны: grouping, dealerIds, siteSource, startDate, endDate
+  // stockCardId (фильтр по карточке) может быть — пробуем, если не примет, fallback без него
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
-  const body = {
+  const baseBody = {
     grouping: "stockCardId",
     dealerIds: [dealerId],
     startDate,
     endDate,
-    siteSource, // null = все источники
+    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
   };
 
-  const r = await axios.post(url, body, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  });
-
-  return r.data;
-}
-
-// Берём статистику конкретно по одной машине из ответа marketing-statistics
-function pickMarketingForCar(marketingPayload, carId) {
-  if (!marketingPayload) return null;
-
-  const statsArr = Array.isArray(marketingPayload.stats) ? marketingPayload.stats : [];
-  // при grouping=stockCardId ожидаем groupBy == carId (иногда строкой)
-  const found = statsArr.find((x) => String(x.groupBy) === String(carId));
-
-  // total — агрегат по всем машинам/фильтрам, нам он не нужен, но можно использовать как fallback
-  return found || null;
-}
-
-function normalizeMarketing(stat) {
-  if (!stat) return null;
-
-  // по swagger TotalStatistics: views, chats{...}, promotionExpenses, placementExpenses, callsExpenses, chatsExpenses, tariffsExpenses, sumExpenses, sumWithBonusesExpenses
-  const total = stat.total || stat; // иногда API кладёт прямо в объект группы
-  const chats = total.chats || {};
-
-  return {
-    views: total.views ?? null,
-
-    chatsTotal: chats.total ?? null,
-    chatsMissed: chats.missed ?? null,
-    chatsTargeted: chats.targeted ?? null,
-
-    promotionExpenses: total.promotionExpenses ?? null,
-    promotionBonusesExpenses: total.promotionBonusesExpenses ?? null,
-    placementExpenses: total.placementExpenses ?? null,
-    callsExpenses: total.callsExpenses ?? null,
-    chatsExpenses: total.chatsExpenses ?? null,
-    tariffsExpenses: total.tariffsExpenses ?? null,
-    sumExpenses: total.sumExpenses ?? null,
-    sumWithBonusesExpenses: total.sumWithBonusesExpenses ?? null,
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
   };
+
+  // 1) пробуем с фильтром по карточке (если API поддерживает)
+  if (stockCardId) {
+    try {
+      const body = { ...baseBody, stockCardIds: [stockCardId] }; // если поле в API есть — отлично
+      const r = await axios.post(url, body, { headers });
+      return { ok: true, data: r.data };
+    } catch (e) {
+      // если API ругнулся на неизвестное поле/валидацию — пойдём без stockCardIds
+      // (не падаем, просто fallback)
+    }
+  }
+
+  // 2) fallback: без stockCardIds (может вернуть агрегат по дилеру за период)
+  const r2 = await axios.post(url, baseBody, { headers });
+  return { ok: true, data: r2.data };
 }
 
-// health check
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
+// health
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+// диагностический роут
+app.get("/__which", (req, res) => {
+  res.type("text").send("server.js route is working (NOT static index.html)");
 });
 
-// главная страница сайта
+// Главная (HTML)
 app.get("/", (req, res) => {
-  res.type("html").send(`
-<!doctype html>
+  res.type("html").send(`<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
   <title>Проверка авто по VIN</title>
   <style>
-    :root{--bg:#ffffff;--text:#0b1020;--muted:#6b7280;--card:#fff;--line:#e7e7e7;--accent:#ff5a2c;}
-    body{font-family:Arial, sans-serif; max-width:980px; margin:40px auto; padding:0 16px; color:var(--text); background:var(--bg);}
-    h1{font-size:56px; margin:0 0 18px;}
-    .card{border:1px solid var(--line); border-radius:18px; padding:22px; box-shadow:0 10px 30px rgba(0,0,0,.05); background:var(--card);}
-    .row{display:flex; gap:14px; flex-wrap:wrap; align-items:center;}
-    input{width:100%; padding:16px; font-size:18px; border:1px solid #d7d7d7; border-radius:14px; outline:none;}
-    input:focus{border-color:#bdbdbd;}
-    .btn{padding:14px 22px; font-size:18px; border:none; border-radius:14px; cursor:pointer;}
-    .btn.primary{background:var(--accent); color:#fff;}
-    .btn.secondary{background:#efefef; color:#111;}
+    body{font-family:Arial, sans-serif; max-width:980px; margin:40px auto; padding:0 16px; background:#f4f4f4;}
+    h1{font-size:44px; margin:0 0 18px;}
+    .card{background:#fff; border-radius:18px; padding:26px; box-shadow:0 12px 40px rgba(0,0,0,.10);}
+    .input{width:100%; padding:16px; font-size:18px; border:1px solid #ddd; border-radius:10px; outline:none;}
+    .row{display:flex; gap:12px; margin-top:14px; flex-wrap:wrap;}
+    .btn{padding:14px 20px; font-size:16px; border:none; border-radius:10px; cursor:pointer;}
+    .btn-primary{background:#ff5a2c; color:#fff;}
+    .btn-secondary{background:#eee; color:#111;}
     .btn:disabled{opacity:.6; cursor:not-allowed;}
-    .muted{color:var(--muted); font-size:18px; margin-top:10px;}
-    .title{font-size:44px; font-weight:800; margin:26px 0 12px;}
-    .grid{display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-top:10px;}
-    .item{border:1px solid var(--line); border-radius:16px; padding:16px;}
-    .label{color:var(--muted); font-size:18px; margin-bottom:6px;}
-    .value{font-size:26px; font-weight:700;}
-    .section{margin-top:22px;}
-    .section h3{margin:0 0 10px; font-size:28px;}
-    .mgrid{display:grid; grid-template-columns:1fr 1fr; gap:16px;}
-    .kv{display:flex; justify-content:space-between; gap:10px; padding:10px 0; border-bottom:1px solid var(--line);}
-    .kv:last-child{border-bottom:none;}
-    .k{color:var(--muted); font-size:18px;}
-    .v{font-size:20px; font-weight:700; text-align:right;}
-    .error{background:#fff1f1; border:1px solid #ffd3d3; color:#b00020; padding:12px 14px; border-radius:14px; margin-top:14px; font-size:18px;}
-    @media (max-width: 860px){
-      h1{font-size:40px;}
-      .title{font-size:34px;}
-      .grid,.mgrid{grid-template-columns:1fr;}
-      .value{font-size:22px;}
-    }
+    .muted{color:#777; font-size:14px; margin-top:10px;}
+    .result{margin-top:18px;}
+    .title{font-size:26px; font-weight:800; margin:8px 0 14px;}
+    .grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
+    .item{border:1px solid #eee; border-radius:12px; padding:12px 14px;}
+    .label{color:#777; font-size:13px; margin-bottom:6px;}
+    .value{font-size:16px; font-weight:700; color:#111;}
+    .error{background:#fff2f2; border:1px solid #ffd1d1; color:#b00020; padding:12px 14px; border-radius:12px;}
+    .loading{color:#555;}
+    .section{margin-top:18px;}
+    .section h3{margin:0 0 10px; font-size:18px;}
+    .pill{display:inline-block; padding:6px 10px; border-radius:999px; background:#f2f2f2; font-size:13px; margin-right:8px;}
+    @media(max-width:720px){ .grid{grid-template-columns:1fr;} h1{font-size:34px;} }
   </style>
 </head>
 <body>
-  <h1>Проверка автомобиля по VIN</h1>
-
   <div class="card">
-    <input id="vin" placeholder="Введите VIN (17 символов)" maxlength="17"/>
-    <div class="row" style="margin-top:14px;">
-      <button id="btn" class="btn primary" onclick="checkVin()">Проверить VIN</button>
-      <button class="btn secondary" onclick="clearAll()">Очистить</button>
+    <h1>Проверка автомобиля по VIN</h1>
+
+    <input id="vin" class="input" placeholder="Введите VIN (17 символов)" maxlength="17"/>
+
+    <div class="row">
+      <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить VIN</button>
+      <button class="btn btn-secondary" onclick="resetAll()">Очистить</button>
     </div>
+
     <div class="muted">Данные берутся из API. Если VIN неверный — покажем ошибку.</div>
 
-    <div id="out" class="section"></div>
+    <div class="result" id="out"></div>
   </div>
 
 <script>
 function esc(s){
-  return String(s ?? '').replace(/[&<>"']/g, (m)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
+  return String(s ?? '').replace(/[&<>"']/g, m => ({
+    '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'
+  }[m]));
 }
-function clearAll(){
+function formatMileage(n){
+  if(n === null || n === undefined || n === '') return '—';
+  const x = Number(n);
+  if(!Number.isFinite(x)) return String(n);
+  return x.toLocaleString('ru-RU') + ' км';
+}
+function formatMoney(n){
+  if(n === null || n === undefined || n === '') return '—';
+  const x = Number(n);
+  if(!Number.isFinite(x)) return String(n);
+  return x.toLocaleString('ru-RU') + ' ₽';
+}
+function resetAll(){
   document.getElementById('vin').value='';
   document.getElementById('out').innerHTML='';
 }
-function fmtInt(n){
-  if(n===null || n===undefined || isNaN(Number(n))) return '—';
-  return Number(n).toLocaleString('ru-RU');
+
+function renderMarketing(marketing){
+  if(!marketing || marketing.ok === false){
+    const msg = marketing?.message || 'Маркетинг недоступен';
+    return '<div class="muted">' + esc(msg) + '</div>';
+  }
+
+  const total = marketing.total || {};
+  const chats = total.chats || {};
+  const src = marketing.bySource || {};
+
+  const srcLine = (k, title) => {
+    const x = src[k] || {};
+    const views = (x.total && x.total.views != null) ? x.total.views : null;
+    const ch = (x.total && x.total.chats) ? x.total.chats : {};
+    const sum = (x.total && (x.total.sumWithBonusesExpenses ?? x.total.sumExpenses)) ?? null;
+
+    return \`
+      <div class="item">
+        <div class="label">\${esc(title)}</div>
+        <div class="value">
+          Просмотры: \${views ?? '—'} · Чаты: \${ch.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
+        </div>
+      </div>
+    \`;
+  };
+
+  return \`
+    <div class="section">
+      <h3>Маркетинговая статистика</h3>
+      <div class="grid">
+        <div class="item">
+          <div class="label">Просмотры</div>
+          <div class="value">\${total.views ?? '—'}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Чаты (всего / пропущено / платные)</div>
+          <div class="value">\${chats.total ?? '—'} / \${chats.missed ?? '—'} / \${chats.targeted ?? '—'}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Расходы всего (с бонусами)</div>
+          <div class="value">\${total.sumWithBonusesExpenses != null ? formatMoney(total.sumWithBonusesExpenses) : (total.sumExpenses != null ? formatMoney(total.sumExpenses) : '—')}</div>
+        </div>
+
+        <div class="item">
+          <div class="label">Расходы: размещение / звонки / чаты / тариф</div>
+          <div class="value">
+            \${total.placementExpenses != null ? formatMoney(total.placementExpenses) : '—'} /
+            \${total.callsExpenses != null ? formatMoney(total.callsExpenses) : '—'} /
+            \${total.chatsExpenses != null ? formatMoney(total.chatsExpenses) : '—'} /
+            \${total.tariffsExpenses != null ? formatMoney(total.tariffsExpenses) : '—'}
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Трафик с классифайдов</h3>
+        <div class="grid">
+          \${srcLine('auto.ru', 'auto.ru')}
+          \${srcLine('avito.ru', 'avito.ru')}
+          \${srcLine('drom.ru', 'drom.ru')}
+        </div>
+        <div class="muted">Если по источникам пусто — значит API не вернул разбивку/данных нет за период.</div>
+      </div>
+    </div>
+  \`;
 }
-function fmtMoney(n){
-  if(n===null || n===undefined || isNaN(Number(n))) return '—';
-  return Number(n).toLocaleString('ru-RU') + ' ₽';
-}
+
 async function checkVin(){
-  const vinEl = document.getElementById('vin');
-  const vin = vinEl.value.trim();
+  const vin = document.getElementById('vin').value.trim();
   const btn = document.getElementById('btn');
   const out = document.getElementById('out');
 
@@ -203,7 +238,7 @@ async function checkVin(){
   if(vin.length !== 17){ out.innerHTML = '<div class="error">VIN должен быть 17 символов</div>'; return; }
 
   btn.disabled = true;
-  out.innerHTML = '<div class="muted">Запрос...</div>';
+  out.innerHTML = '<div class="loading">Запрос...</div>';
 
   try{
     const r = await fetch('/check-vin?vin=' + encodeURIComponent(vin));
@@ -215,74 +250,33 @@ async function checkVin(){
       return;
     }
 
-    // Машина
-    const car = data.car || {};
-    const title = \`\${esc(car.brand)} \${esc(car.model)} \${esc(car.year)}\`;
-
-    // Маркетинг
-    const m = data.marketing;
-    const marketingHtml = m ? \`
-      <div class="mgrid">
-        <div class="item">
-          <div class="label">Просмотры</div>
-          <div class="value">\${fmtInt(m.views)}</div>
-        </div>
-        <div class="item">
-          <div class="label">Чаты</div>
-          <div class="value">\${fmtInt(m.chatsTotal)}</div>
-        </div>
-
-        <div class="item">
-          <div class="label">Пропущенные чаты</div>
-          <div class="value">\${fmtInt(m.chatsMissed)}</div>
-        </div>
-        <div class="item">
-          <div class="label">Платные чаты</div>
-          <div class="value">\${fmtInt(m.chatsTargeted)}</div>
-        </div>
-      </div>
-
-      <div class="section">
-        <h3>Расходы</h3>
-        <div class="item">
-          <div class="kv"><div class="k">Размещение на классифайдах</div><div class="v">\${fmtMoney(m.placementExpenses)}</div></div>
-          <div class="kv"><div class="k">Промо-услуги</div><div class="v">\${fmtMoney(m.promotionExpenses)}</div></div>
-          <div class="kv"><div class="k">Звонки</div><div class="v">\${fmtMoney(m.callsExpenses)}</div></div>
-          <div class="kv"><div class="k">Чаты</div><div class="v">\${fmtMoney(m.chatsExpenses)}</div></div>
-          <div class="kv"><div class="k">Тариф</div><div class="v">\${fmtMoney(m.tariffsExpenses)}</div></div>
-          <div class="kv"><div class="k"><b>Итого</b></div><div class="v"><b>\${fmtMoney(m.sumExpenses)}</b></div></div>
-          <div class="kv"><div class="k">Итого с бонусами</div><div class="v">\${fmtMoney(m.sumWithBonusesExpenses)}</div></div>
-        </div>
-      </div>
-    \` : \`<div class="muted" style="margin-top:14px;">Маркетинг не удалось получить (проверь доступ/права в API)</div>\`;
-
     out.innerHTML = \`
-      <div class="title">\${title}</div>
+      <div class="title">\${esc(data.brand)} \${esc(data.model)} \${esc(data.year)}</div>
+
       <div class="grid">
         <div class="item">
           <div class="label">Комплектация</div>
-          <div class="value">\${esc(car.equipmentName)}</div>
+          <div class="value">\${esc(data.equipmentName || '—')}</div>
         </div>
+
         <div class="item">
           <div class="label">Модификация</div>
-          <div class="value">\${esc(car.modificationName)}</div>
+          <div class="value">\${esc(data.modificationName || '—')}</div>
         </div>
+
         <div class="item">
           <div class="label">Пробег</div>
-          <div class="value">\${fmtInt(car.mileage)} км</div>
+          <div class="value">\${esc(formatMileage(data.mileage))}</div>
         </div>
+
         <div class="item">
           <div class="label">Цвет</div>
-          <div class="value">\${esc(car.color)}</div>
+          <div class="value">\${esc(data.color || '—')}</div>
         </div>
       </div>
 
-      <div class="section">
-        <h3>Маркетинговая статистика</h3>
-        \${marketingHtml}
-      </div>
+      \${renderMarketing(data.marketing)}
     \`;
-
   }catch(e){
     out.innerHTML = '<div class="error">Ошибка: ' + esc(e.message) + '</div>';
   }finally{
@@ -291,77 +285,107 @@ async function checkVin(){
 }
 </script>
 </body>
-</html>
-`);
+</html>`);
 });
 
-// API endpoint
+// VIN -> нужные поля + маркетинг
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ ok: false, error: "VIN is required" });
 
   try {
     const token = await getToken();
-    const car = await fetchCarByVin({ token, vin });
 
-    // нормализуем нужные поля
-    const carOut = {
-      id: car.id,
-      dealerId: car.dealerId,
-      vin: car.vin,
+    // 1) авто по VIN
+    const carResponse = await axios.get(
+      "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
+      {
+        params: { vin },
+        headers: { Authorization: `Bearer ${token}` },
+      }
+    );
 
-      brand: car.brand,
-      model: car.model,
-      year: car.year,
+    const c = carResponse.data || {};
 
-      equipmentName: car.equipmentName,
-      modificationName: car.modificationName,
-
-      mileage: car.mileage,
-      color: car.color,
-    };
-
-    // период по умолчанию: последние 30 дней (или можно поменять)
-    const end = new Date();
-    const start = new Date(end.getTime() - 30 * 24 * 60 * 60 * 1000);
-    const toISO = (d) => d.toISOString().slice(0, 10); // YYYY-MM-DD
+    // 2) маркетинг за последние 30 дней
+    const endDate = toISODate(new Date());
+    const startDate = toISODate(addDays(new Date(), -30));
 
     let marketing = null;
 
-    try {
-      const marketingPayload = await fetchMarketing({
-        token,
-        dealerId: car.dealerId,
-        startDate: toISO(start),
-        endDate: toISO(end),
-        siteSource: null, // все источники
-      });
+    // dealerId в ответе есть точно (dealerId)
+    if (c.dealerId) {
+      try {
+        // общий маркетинг (без фильтра по источнику)
+        const base = await fetchMarketing({
+          token,
+          dealerId: c.dealerId,
+          stockCardId: c.id, // пробуем как ID карточки
+          startDate,
+          endDate,
+          siteSource: null,
+        });
 
-      const statForCar = pickMarketingForCar(marketingPayload, car.id);
-      marketing = normalizeMarketing(statForCar);
-    } catch (e) {
-      // маркетинг опциональный — не ломаем весь ответ
-      marketing = null;
+        // по классифайдам отдельно
+        const bySource = {};
+        for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
+          try {
+            const rr = await fetchMarketing({
+              token,
+              dealerId: c.dealerId,
+              stockCardId: c.id,
+              startDate,
+              endDate,
+              siteSource: s,
+            });
+            bySource[s] = rr.data || null;
+          } catch (_) {
+            bySource[s] = null;
+          }
+        }
+
+        marketing = {
+          ok: true,
+          // некоторые API возвращают {total, stats}, мы аккуратно вытаскиваем
+          total: base?.data?.total || null,
+          stats: base?.data?.stats || null,
+          bySource: {
+            "auto.ru": { total: bySource["auto.ru"]?.total || null, stats: bySource["auto.ru"]?.stats || null },
+            "avito.ru": { total: bySource["avito.ru"]?.total || null, stats: bySource["avito.ru"]?.stats || null },
+            "drom.ru": { total: bySource["drom.ru"]?.total || null, stats: bySource["drom.ru"]?.stats || null },
+          },
+          period: { startDate, endDate },
+        };
+      } catch (e) {
+        marketing = {
+          ok: false,
+          message: "Маркетинг не удалось получить (проверь доступ/права в API)",
+          details: e?.response?.data || e.message,
+        };
+      }
+    } else {
+      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
     }
 
-    res.json({
+    return res.json({
       ok: true,
-      car: carOut,
+      brand: c.brand,
+      model: c.model,
+      year: c.year,
+      equipmentName: c.equipmentName,
+      modificationName: c.modificationName,
+      mileage: c.mileage,
+      color: c.color,
       marketing,
     });
   } catch (error) {
-    const status = error?.response?.status;
+    const status = error?.response?.status || 500;
     const data = error?.response?.data;
-    const message =
-      (data && (data.message || data.error)) ||
-      error.message ||
-      "API request failed";
-
-    res.status(status || 500).json({
+    return res.status(status).json({
       ok: false,
-      error: message,
-      status: status || 500,
-      details: data || null,
+      error: "API request failed",
+      status,
+      message: data?.message || data?.error || error.message,
     });
   }
 });
