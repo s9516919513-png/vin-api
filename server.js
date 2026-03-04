@@ -1,4 +1,5 @@
-// server.js
+// server.js (ПОЛНАЯ ВЕРСИЯ) — просто скопируй целиком и замени файл
+
 const express = require("express");
 const axios = require("axios");
 
@@ -14,7 +15,7 @@ app.use((req, res, next) => {
   next();
 });
 
-/* ---------------- helpers ---------------- */
+// helpers
 function toISODate(d) {
   const x = new Date(d);
   const yyyy = x.getFullYear();
@@ -28,41 +29,6 @@ function addDays(date, days) {
   return d;
 }
 
-// из ответа marketing-statistics выбираем строку по конкретной карточке
-function pickStatByStockCardId(payload, stockCardId) {
-  if (!payload) return null;
-
-  // чаще всего приходит { total: {...}, stats: [...] }
-  const stats = Array.isArray(payload.stats) ? payload.stats : [];
-  const found = stats.find((x) => String(x.groupBy) === String(stockCardId));
-  if (!found) return null;
-
-  // у строки может быть total внутри
-  return found.total || found;
-}
-
-function normalizeMarketingTotal(total) {
-  if (!total) return null;
-  const chats = total.chats || {};
-  return {
-    views: total.views ?? null,
-    chats: {
-      total: chats.total ?? null,
-      missed: chats.missed ?? null,
-      targeted: chats.targeted ?? null,
-    },
-    promotionExpenses: total.promotionExpenses ?? null,
-    promotionBonusesExpenses: total.promotionBonusesExpenses ?? null,
-    placementExpenses: total.placementExpenses ?? null,
-    callsExpenses: total.callsExpenses ?? null,
-    chatsExpenses: total.chatsExpenses ?? null,
-    tariffsExpenses: total.tariffsExpenses ?? null,
-    sumExpenses: total.sumExpenses ?? null,
-    sumWithBonusesExpenses: total.sumWithBonusesExpenses ?? null,
-  };
-}
-
-/* ---------------- auth ---------------- */
 async function getToken() {
   const tokenResponse = await axios.post(
     "https://lk.cm.expert/oauth/token",
@@ -76,35 +42,36 @@ async function getToken() {
   return tokenResponse.data.access_token;
 }
 
-/* ---------------- marketing ----------------
-   Важно: по вашему swagger body = { grouping, dealerIds, siteSource, startDate, endDate }
-   Никаких stockCardIds не отправляем. Фильтруем нужную карточку уже по ответу (stats[].groupBy).
-*/
+// ✅ ВАЖНО: body строго по swagger (без stockCardIds!)
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
   const body = {
     grouping: "stockCardId",
     dealerIds: [dealerId],
+    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
     startDate,
     endDate,
-    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
   };
 
-  const r = await axios.post(url, body, {
-    headers: {
-      Authorization: `Bearer ${token}`,
-      "Content-Type": "application/json",
-    },
-  });
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
 
+  const r = await axios.post(url, body, { headers });
   return r.data;
 }
 
-/* ---------------- health ---------------- */
+// health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-/* ---------------- main (HTML) ---------------- */
+// диагностический роут
+app.get("/__which", (req, res) => {
+  res.type("text").send("server.js route is working");
+});
+
+// Главная (HTML)
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
@@ -126,7 +93,7 @@ app.get("/", (req, res) => {
     .result{margin-top:18px;}
     .title{font-size:26px; font-weight:800; margin:8px 0 14px;}
     .grid{display:grid; grid-template-columns:1fr 1fr; gap:12px;}
-    .item{border:1px solid #eee; border-radius:12px; padding:12px 14px;}
+    .item{border:1px solid #eee; border-radius:12px; padding:12px 14px; background:#fff;}
     .label{color:#777; font-size:13px; margin-bottom:6px;}
     .value{font-size:16px; font-weight:700; color:#111;}
     .error{background:#fff2f2; border:1px solid #ffd1d1; color:#b00020; padding:12px 14px; border-radius:12px;}
@@ -177,25 +144,25 @@ function resetAll(){
 
 function renderMarketing(marketing){
   if(!marketing || marketing.ok === false){
-    const msg = marketing?.message || 'Маркетинг недоступен';
+    const msg = marketing?.message || 'Маркетинг не удалось получить';
     return '<div class="muted">' + esc(msg) + '</div>';
   }
 
   const total = marketing.total || {};
   const chats = total.chats || {};
-  const bySource = marketing.bySource || {};
+  const src = marketing.bySource || {};
 
-  const srcLine = (key, title) => {
-    const src = bySource[key] || {};
-    const t = src.total || {};
-    const c = (t.chats || {});
-    const sum = (t.sumWithBonusesExpenses ?? t.sumExpenses);
+  const srcLine = (k, title) => {
+    const x = src[k] || {};
+    const views = (x.total && x.total.views != null) ? x.total.views : null;
+    const ch = (x.total && x.total.chats) ? x.total.chats : {};
+    const sum = (x.total && (x.total.sumWithBonusesExpenses ?? x.total.sumExpenses)) ?? null;
 
     return \`
       <div class="item">
         <div class="label">\${esc(title)}</div>
         <div class="value">
-          Просмотры: \${t.views ?? '—'} · Чаты: \${c.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
+          Просмотры: \${views ?? '—'} · Чаты: \${ch.total ?? '—'} · Расходы: \${sum != null ? formatMoney(sum) : '—'}
         </div>
       </div>
     \`;
@@ -203,8 +170,7 @@ function renderMarketing(marketing){
 
   return \`
     <div class="section">
-      <h3>Маркетинговая статистика</h3>
-
+      <h3>Маркетинговая статистика (последние 30 дней)</h3>
       <div class="grid">
         <div class="item">
           <div class="label">Просмотры</div>
@@ -239,7 +205,7 @@ function renderMarketing(marketing){
           \${srcLine('avito.ru', 'avito.ru')}
           \${srcLine('drom.ru', 'drom.ru')}
         </div>
-        <div class="muted">Если по источникам пусто — значит API не вернул данных за период.</div>
+        <div class="muted">Если по источникам пусто — значит API не вернул разбивку/данных нет за период.</div>
       </div>
     </div>
   \`;
@@ -304,7 +270,7 @@ async function checkVin(){
 </html>`);
 });
 
-/* ---------------- API: VIN -> нужные поля + маркетинг ---------------- */
+// VIN -> нужные поля + маркетинг
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ ok: false, error: "VIN is required" });
@@ -315,21 +281,24 @@ app.get("/check-vin", async (req, res) => {
     // 1) авто по VIN
     const carResponse = await axios.get(
       "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
-      { params: { vin }, headers: { Authorization: `Bearer ${token}` } }
+      {
+        params: { vin },
+        headers: { Authorization: `Bearer ${token}` },
+      }
     );
 
     const c = carResponse.data || {};
 
-    // 2) маркетинг (последние 30 дней)
+    // 2) маркетинг за последние 30 дней
     const endDate = toISODate(new Date());
     const startDate = toISODate(addDays(new Date(), -30));
 
     let marketing = null;
 
-    if (c.dealerId && c.id) {
+    if (c.dealerId) {
       try {
-        // общий маркетинг за период (по всем источникам)
-        const all = await fetchMarketing({
+        // общий маркетинг (без источника)
+        const baseData = await fetchMarketing({
           token,
           dealerId: c.dealerId,
           startDate,
@@ -337,66 +306,42 @@ app.get("/check-vin", async (req, res) => {
           siteSource: null,
         });
 
-        // берем данные именно по этой карточке из stats
-        const allForCar = normalizeMarketingTotal(pickStatByStockCardId(all, c.id));
-
-        // по источникам (классифайды)
-        const bySource = {};
+        // по классифайдам отдельно
+        const bySourceRaw = {};
         for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
-async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
-  const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
-
-  const body = {
-    grouping: "stockCardId",
-    dealerIds: [dealerId],
-    startDate,
-    endDate,
-    siteSource
-  };
-
-  const headers = {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  };
-
-  const r = await axios.post(url, body, { headers });
-  return r.data;
-};
-
-          bySource[s] = {
-            total: normalizeMarketingTotal(pickStatByStockCardId(one, c.id)),
-            period: { startDate, endDate },
-          };
+          try {
+            bySourceRaw[s] = await fetchMarketing({
+              token,
+              dealerId: c.dealerId,
+              startDate,
+              endDate,
+              siteSource: s,
+            });
+          } catch (_) {
+            bySourceRaw[s] = null;
+          }
         }
 
         marketing = {
           ok: true,
-          total: allForCar, // уже по этой карточке
-          bySource, // уже по этой карточке
+          total: baseData?.total || null,
+          stats: baseData?.stats || null,
+          bySource: {
+            "auto.ru": { total: bySourceRaw["auto.ru"]?.total || null, stats: bySourceRaw["auto.ru"]?.stats || null },
+            "avito.ru": { total: bySourceRaw["avito.ru"]?.total || null, stats: bySourceRaw["avito.ru"]?.stats || null },
+            "drom.ru": { total: bySourceRaw["drom.ru"]?.total || null, stats: bySourceRaw["drom.ru"]?.stats || null },
+          },
           period: { startDate, endDate },
         };
-
-        // если по карточке вообще нет данных — покажем понятное сообщение
-        if (!marketing.total) {
-          marketing = {
-            ok: false,
-            message: "Маркетинговых данных по этой карточке за период нет",
-            period: { startDate, endDate },
-          };
-        }
       } catch (e) {
         marketing = {
-  ok: false,
-  message: "Маркетинг не удалось получить",
-  status: e?.response?.status || null,
-  details: e?.response?.data || e?.message || String(e),
+          ok: false,
+          message: "Маркетинг не удалось получить",
+          details: e?.response?.data || e.message,
         };
       }
     } else {
-      marketing = {
-        ok: false,
-        message: "Нет dealerId/id карточки — маркетинг не запросить",
-      };
+      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
     }
 
     return res.json({
@@ -418,6 +363,7 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
       error: "API request failed",
       status,
       message: data?.message || data?.error || error.message,
+      details: data || null,
     });
   }
 });
