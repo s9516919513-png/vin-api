@@ -343,13 +343,25 @@ app.get("/check-vin", async (req, res) => {
         // по источникам (классифайды)
         const bySource = {};
         for (const s of ["auto.ru", "avito.ru", "drom.ru"]) {
-          const one = await fetchMarketing({
-            token,
-            dealerId: c.dealerId,
-            startDate,
-            endDate,
-            siteSource: s,
-          });
+async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
+  const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
+
+  const body = {
+    grouping: "stockCardId",
+    dealerIds: [dealerId],
+    startDate,
+    endDate,
+    siteSource
+  };
+
+  const headers = {
+    Authorization: `Bearer ${token}`,
+    "Content-Type": "application/json",
+  };
+
+  const r = await axios.post(url, body, { headers });
+  return r.data;
+};
 
           bySource[s] = {
             total: normalizeMarketingTotal(pickStatByStockCardId(one, c.id)),
