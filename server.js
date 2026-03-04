@@ -99,11 +99,15 @@ app.get("/check-vin", async (req, res) => {
 
     const token = tokenResponse.data.access_token;
 
-    const carResponse = await axios.get(
-      `https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car?vin=${encodeURIComponent(vin)}`,
-      { headers: { Authorization: `Bearer ${token}` } }
-    );
-
+const carResponse = await axios.get(
+  "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
+  {
+    params: { vin: vin },
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  }
+);
     res.json(carResponse.data);
   } catch (error) {
     // покажем полезнее, чем просто message
