@@ -1,4 +1,4 @@
-// server.js — полный файл (VIN + красивый вывод + маркетинг + DEBUG, чтобы понять почему падает)
+// server.js — полный файл (VIN + красивый вывод + маркетинг + DEBUG)
 
 const express = require("express");
 const axios = require("axios");
@@ -42,16 +42,17 @@ async function getToken() {
   return tokenResponse.data.access_token;
 }
 
-// ✅ Маркетинг + debug (чтобы увидеть точную причину 400/403/404)
+// ✅ Маркетинг + debug
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
+  // ✅ FIX: grouping должен быть "stockCard" (а не stockCardId)
   const body = {
-    grouping: "stockCardId",
+    grouping: "stockCard",
     dealerIds: [dealerId],
     siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
-    startDate, // YYYY-MM-DD
-    endDate, // YYYY-MM-DD
+    startDate,  // YYYY-MM-DD
+    endDate,    // YYYY-MM-DD
   };
 
   const headers = {
@@ -76,7 +77,7 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
 // health
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// диагностический роут (чтобы понимать, что отдается именно server.js, а не статика)
+// диагностический роут
 app.get("/__which", (req, res) => {
   res.type("text").send("server.js route is working (NOT static index.html)");
 });
@@ -154,7 +155,6 @@ function resetAll(){
 }
 
 function renderMarketing(marketing){
-  // ✅ если маркетинг не пришёл — покажем причину (status/details/request body)
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг не удалось получить';
     const debug = marketing?.debug ? JSON.stringify(marketing.debug, null, 2) : null;
@@ -349,14 +349,12 @@ app.get("/check-vin", async (req, res) => {
           "drom.ru": bySource["drom.ru"].ok ? { total: bySource["drom.ru"].data?.total || null } : null,
         },
 
-        // ✅ покажем точную причину ошибки, если ok=false
         debug: {
           base,
           bySource,
         },
       };
 
-      // если base упал — добавим человекочитаемое сообщение
       if (!base.ok) {
         marketing.ok = false;
         marketing.message = "Маркетинг не удалось получить (см. debug ниже — там статус/причина)";
