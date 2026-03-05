@@ -4,15 +4,14 @@ const axios = require("axios");
 const app = express();
 const PORT = Number(process.env.PORT || 3000);
 
-// ---------- axios ----------
+// -------------------- axios --------------------
 const http = axios.create({
   timeout: 20000,
-  // полезно для Railway/прокси
   maxBodyLength: Infinity,
   maxContentLength: Infinity,
 });
 
-// ---------- CORS ----------
+// -------------------- CORS --------------------
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
@@ -21,7 +20,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- helpers ----------
+// -------------------- helpers --------------------
 function toISODate(d) {
   const x = new Date(d);
   const yyyy = x.getFullYear();
@@ -35,13 +34,18 @@ function addDays(date, days) {
   return d;
 }
 function clamp(n, a, b) {
-  return Math.max(a, Math.min(b, n));
+  const x = Number(n);
+  if (!Number.isFinite(x)) return a;
+  return Math.max(a, Math.min(b, x));
+}
+function mkKey(parts) {
+  return parts.map((x) => String(x ?? "")).join("|");
 }
 
-// ---------- health ----------
+// -------------------- health --------------------
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
-// ---------- token cache ----------
+// -------------------- token cache --------------------
 let tokenCache = { token: null, expiresAt: 0 };
 
 async function getToken() {
@@ -54,8 +58,8 @@ async function getToken() {
   const clientId = process.env.CLIENT_ID;
   const clientSecret = process.env.CLIENT_SECRET;
 
+  // Не падаем на старте — но запросы к API будут отдавать понятную ошибку
   if (!clientId || !clientSecret) {
-    // важно: не крашим сервер, а даём понятную ошибку
     const err = new Error("Missing CLIENT_ID or CLIENT_SECRET env vars");
     err.status = 500;
     throw err;
@@ -78,11 +82,9 @@ async function getToken() {
   return token;
 }
 
-// ---------- marketing cache (TTL) ----------
+// -------------------- marketing cache (TTL) --------------------
 const marketingCache = new Map();
-function mkKey(parts) {
-  return parts.map((x) => String(x ?? "")).join("|");
-}
+
 function cacheGet(key) {
   const hit = marketingCache.get(key);
   if (!hit) return null;
@@ -96,12 +98,20 @@ function cacheSet(key, value, ttlMs) {
   marketingCache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
-// ---------- marketing API ----------
+// -------------------- marketing API --------------------
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
+  // ВАЖНО: dealerIds как ЧИСЛА, иначе CM.Expert нередко отдаёт пусто/ошибку
+  const dealerIdNum = Number(dealerId);
+  if (!Number.isFinite(dealerIdNum)) {
+    const err = new Error("Invalid dealerId (must be a number)");
+    err.status = 400;
+    throw err;
+  }
+
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
   const body = {
     grouping: "periodDay",
-    dealerIds: [dealerId],
+    dealerIds: [dealerIdNum],
     siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
     startDate,
     endDate,
@@ -117,7 +127,7 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   return r.data;
 }
 
-// суммирование total (на случай days=90 из 3 кусков)
+// суммирование total по кускам
 function sumTotals(a, b) {
   const out = { ...(a || {}) };
   out.views = (a?.views || 0) + (b?.views || 0);
@@ -143,20 +153,21 @@ function sumTotals(a, b) {
   return out;
 }
 
-// объединение stats по дате (если даты пересекутся)
+// объединение stats по дате (если пересечения)
 function mergeStats(statsArr) {
   const m = new Map(); // date -> item
   for (const it of statsArr || []) {
     const date = it?.date;
     if (!date) continue;
+
     const prev = m.get(date);
     if (!prev) {
       m.set(date, JSON.parse(JSON.stringify(it)));
     } else {
-      // суммируем основные метрики
       prev.views = (prev.views || 0) + (it.views || 0);
       prev.sumExpenses = (prev.sumExpenses || 0) + (it.sumExpenses || 0);
-      prev.sumWithBonusesExpenses = (prev.sumWithBonusesExpenses || 0) + (it.sumWithBonusesExpenses || 0);
+      prev.sumWithBonusesExpenses =
+        (prev.sumWithBonusesExpenses || 0) + (it.sumWithBonusesExpenses || 0);
 
       const pc = prev.chats || {};
       const ic = it.chats || {};
@@ -167,35 +178,42 @@ function mergeStats(statsArr) {
       };
     }
   }
-  // сортировка по дате
   return Array.from(m.values()).sort((x, y) => String(x.date).localeCompare(String(y.date)));
 }
 
+// сборка маркетинга (7/30/90; 90 = 3×30)
 async function getMarketingBundle({ token, dealerId, days }) {
-  // days: 7/30/90
-  days = clamp(Number(days || 30), 1, 90);
-
-  // период разбиваем по 30 дней (ограничение API)
+  days = clamp(days || 30, 1, 90);
   const today = new Date();
+
   const chunks = [];
   if (days <= 30) {
     chunks.push({ startDate: toISODate(addDays(today, -days)), endDate: toISODate(today) });
   } else {
-    // 90 = 3 чанка
     chunks.push({ startDate: toISODate(addDays(today, -30)), endDate: toISODate(today) });
-    chunks.push({ startDate: toISODate(addDays(today, -60)), endDate: toISODate(addDays(today, -30)) });
-    chunks.push({ startDate: toISODate(addDays(today, -90)), endDate: toISODate(addDays(today, -60)) });
+    chunks.push({
+      startDate: toISODate(addDays(today, -60)),
+      endDate: toISODate(addDays(today, -30)),
+    });
+    chunks.push({
+      startDate: toISODate(addDays(today, -90)),
+      endDate: toISODate(addDays(today, -60)),
+    });
   }
 
   const sources = ["auto.ru", "avito.ru", "drom.ru"];
 
-  // для каждого чанка: 1 базовый + 3 источника (параллельно)
   let total = null;
   let statsAll = [];
+
   const bySourceTotals = { "auto.ru": null, "avito.ru": null, "drom.ru": null };
   const bySourceStats = { "auto.ru": [], "avito.ru": [], "drom.ru": [] };
 
+  let anySuccess = false;
+  let lastError = null;
+
   for (const ch of chunks) {
+    // параллельно: base + источники
     const tasks = [
       fetchMarketing({ token, dealerId, ...ch, siteSource: null }),
       ...sources.map((s) => fetchMarketing({ token, dealerId, ...ch, siteSource: s })),
@@ -205,20 +223,37 @@ async function getMarketingBundle({ token, dealerId, days }) {
 
     // base
     if (results[0].status === "fulfilled") {
+      anySuccess = true;
       const base = results[0].value;
       total = sumTotals(total, base?.total || {});
       if (Array.isArray(base?.stats)) statsAll.push(...base.stats);
+    } else {
+      lastError = results[0].reason;
     }
 
     // sources
     sources.forEach((s, idx) => {
       const rr = results[idx + 1];
       if (rr.status === "fulfilled") {
+        anySuccess = true;
         const v = rr.value;
         bySourceTotals[s] = sumTotals(bySourceTotals[s], v?.total || {});
         if (Array.isArray(v?.stats)) bySourceStats[s].push(...v.stats);
+      } else {
+        lastError = rr.reason;
       }
     });
+  }
+
+  // КЛЮЧ: если все запросы упали — возвращаем ok:false, чтобы фронт показал причину
+  if (!anySuccess) {
+    const status = lastError?.response?.status || lastError?.status || 500;
+    const msg =
+      lastError?.response?.data?.message ||
+      lastError?.response?.data?.error ||
+      lastError?.message ||
+      "Marketing API failed";
+    return { ok: false, status, message: msg };
   }
 
   const period = {
@@ -246,7 +281,7 @@ async function getMarketingBundle({ token, dealerId, days }) {
   };
 }
 
-// ---------- routes ----------
+// -------------------- UI --------------------
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
@@ -465,7 +500,7 @@ function fmtMileage(x){
 }
 
 function setDays(days){
-  current.days = days;
+  current.days = Number(days);
   document.querySelectorAll(".pill").forEach(b => {
     b.classList.toggle("active", Number(b.dataset.days) === Number(days));
   });
@@ -607,7 +642,6 @@ function drawCharts(m){
     }
   });
 
-  // источники: суммарные чаты
   const srcKeys = ["auto.ru","avito.ru","drom.ru"];
   const srcLabels = ["auto.ru","avito.ru","drom.ru"];
   const srcChats = srcKeys.map(k => Number(m.bySource?.[k]?.total?.chats?.total || 0));
@@ -678,7 +712,6 @@ async function loadMarketing(){
     }
 
     holder.innerHTML = renderMarketing(data.marketing);
-    // chart canvas теперь в DOM
     drawCharts(data.marketing);
   }catch(e){
     holder.innerHTML = '<div class="error">Маркетинг недоступен: ' + esc(e.message) + '</div>';
@@ -689,13 +722,14 @@ async function loadMarketing(){
 </html>`);
 });
 
-// ---------- /check-vin ----------
+// -------------------- /check-vin --------------------
 app.get("/check-vin", async (req, res) => {
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).json({ ok: false, message: "VIN is required" });
 
   try {
     const token = await getToken();
+
     const r = await http.get("https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car", {
       params: { vin },
       headers: { Authorization: `Bearer ${token}` },
@@ -711,21 +745,26 @@ app.get("/check-vin", async (req, res) => {
       modificationName: c.modificationName,
       mileage: c.mileage,
       color: c.color,
-      dealerId: c.dealerId || null,
+      dealerId: c.dealerId ?? null,
     });
   } catch (e) {
     const status = e?.status || e?.response?.status || 500;
-    const msg = e?.response?.data?.message || e?.message || "VIN request failed";
+    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "VIN request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
 
-// ---------- /marketing ----------
+// -------------------- /marketing --------------------
 app.get("/marketing", async (req, res) => {
-  const dealerId = String(req.query.dealerId || "").trim();
-  const days = clamp(Number(req.query.days || 30), 1, 90);
+  const dealerIdRaw = String(req.query.dealerId || "").trim();
+  const days = clamp(req.query.days || 30, 1, 90);
 
-  if (!dealerId) return res.status(400).json({ ok: false, message: "dealerId is required" });
+  if (!dealerIdRaw) return res.status(400).json({ ok: false, message: "dealerId is required" });
+
+  const dealerId = Number(dealerIdRaw);
+  if (!Number.isFinite(dealerId)) {
+    return res.status(400).json({ ok: false, message: "dealerId must be a number" });
+  }
 
   const key = mkKey(["mkt", dealerId, days]);
   const cached = cacheGet(key);
@@ -735,18 +774,23 @@ app.get("/marketing", async (req, res) => {
     const token = await getToken();
     const marketing = await getMarketingBundle({ token, dealerId, days });
 
-    // кэшируем 10 минут если ok, иначе 2 минуты чтобы не долбить API
-    cacheSet(key, marketing, marketing.ok ? 10 * 60 * 1000 : 2 * 60 * 1000);
+    // кэш: ok=10 минут; ошибка=1 минута (чтобы не долбить API)
+    cacheSet(key, marketing, marketing.ok ? 10 * 60 * 1000 : 60 * 1000);
+
+    if (!marketing.ok) {
+      // ВАЖНО: отдаём ошибку, чтобы фронт показал причину, а не "—"
+      return res.status(502).json({ ok: false, message: marketing.message, status: marketing.status });
+    }
 
     return res.json({ ok: true, cached: false, marketing });
   } catch (e) {
-    const status = e?.status || e?.response?.status || 500;
-    const msg = e?.response?.data?.message || e?.message || "Marketing request failed";
+    const status = e?.response?.status || 500;
+    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "Marketing request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
 
-// ---------- hardening: log crashes ----------
+// -------------------- hardening --------------------
 process.on("unhandledRejection", (reason) => {
   console.error("[unhandledRejection]", reason);
 });
@@ -754,7 +798,7 @@ process.on("uncaughtException", (err) => {
   console.error("[uncaughtException]", err);
 });
 
-// ---------- start ----------
+// -------------------- start --------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on", PORT);
 });
