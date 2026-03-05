@@ -52,7 +52,6 @@ async function getToken() {
 function isLikelyHtmlBody(data) {
   return typeof data === "string" && data.trim().startsWith("<!DOCTYPE");
 }
-
 function clipBody(data, max = 2000) {
   if (data == null) return null;
   if (typeof data === "string") return data.slice(0, max);
@@ -82,8 +81,8 @@ async function safeRequest({ method, url, token, params, body }) {
   const html = isLikelyHtmlBody(r.data);
 
   return {
-    url,
     method,
+    url,
     status: r.status,
     contentType,
     isHtml: html,
@@ -98,20 +97,29 @@ function summarizeStockCars(payload) {
   const chats = total?.chats || {};
   const statsLen = Array.isArray(payload?.stats) ? payload.stats.length : null;
 
-  const anyNonNull =
-    [total.views, chats.total, chats.missed, chats.targeted,
-     total.sumExpenses, total.sumWithBonusesExpenses,
-     total.placementExpenses, total.callsExpenses, total.chatsExpenses, total.tariffsExpenses]
-      .some((v) => v !== null && v !== undefined);
+  const anyNonNull = [
+    total.views,
+    chats.total,
+    chats.missed,
+    chats.targeted,
+    total.sumExpenses,
+    total.sumWithBonusesExpenses,
+    total.placementExpenses,
+    total.callsExpenses,
+    total.chatsExpenses,
+    total.tariffsExpenses,
+    total.promotionExpenses,
+    total.promotionBonusesExpenses,
+  ].some((v) => v !== null && v !== undefined);
 
   return { statsLen, anyNonNull, total };
 }
 
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
-<html lang="ru">
-<head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-<title>AP marketing debug</title>
+<html lang="ru"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Marketing debug</title>
 <style>
 body{font-family:Arial,sans-serif;max-width:1100px;margin:24px auto;padding:0 16px;}
 input{width:100%;padding:12px;font-size:16px;}
@@ -121,8 +129,8 @@ pre{white-space:pre-wrap;background:#111;color:#0f0;padding:12px;border-radius:8
 .row button{margin-top:0}
 </style></head>
 <body>
-<h2>Автопоиск: где живёт маркетинг</h2>
-<p>Вводишь VIN → получаем авто → пробуем набор эндпоинтов (включая stock-cars). Результат = JSON.</p>
+<h2>Debug маркетинга / прав доступа</h2>
+<p>VIN → авто → пробуем stock-cars и проверяем какие ручки дают 403.</p>
 <input id="vin" placeholder="VIN (17 символов)" maxlength="17"/>
 <div class="row">
   <button onclick="run()">Проверить</button>
@@ -133,9 +141,9 @@ pre{white-space:pre-wrap;background:#111;color:#0f0;padding:12px;border-radius:8
 async function run(){
   const vin = document.getElementById('vin').value.trim();
   const out = document.getElementById('out');
-  if(!vin){ out.textContent = "Введите VIN"; return; }
-  out.textContent = "Запрос...";
-  const r = await fetch('/scan?vin='+encodeURIComponent(vin), { cache:'no-store' });
+  if(!vin){ out.textContent="Введите VIN"; return; }
+  out.textContent="Запрос...";
+  const r = await fetch('/debug?vin='+encodeURIComponent(vin), {cache:'no-store'});
   const t = await r.text();
   try{ out.textContent = JSON.stringify(JSON.parse(t), null, 2); }
   catch(e){ out.textContent = "NOT JSON:\\n"+t; }
@@ -144,7 +152,7 @@ async function run(){
 </body></html>`);
 });
 
-app.get("/scan", async (req, res) => {
+app.get("/debug", async (req, res) => {
   res.type("json");
   const vin = String(req.query.vin || "").trim();
   if (!vin) return res.status(400).send(JSON.stringify({ ok: false, error: "VIN is required" }));
@@ -152,7 +160,7 @@ app.get("/scan", async (req, res) => {
   try {
     const token = await getToken();
 
-    // 1) car meta
+    // авто по VIN
     const carResp = await safeRequest({
       method: "GET",
       url: "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
@@ -167,77 +175,78 @@ app.get("/scan", async (req, res) => {
     const car = carResp.json || {};
     const dealerId = car.dealerId ?? null;
 
-    const period = {
-      startDate: toISODate(addDays(new Date(), -30)),
-      endDate: toISODate(new Date()),
-    };
+    const periods = [
+      { name: "last30d", startDate: toISODate(addDays(new Date(), -30)), endDate: toISODate(new Date()) },
+      { name: "last31d", startDate: toISODate(addDays(new Date(), -31)), endDate: toISODate(new Date()) },
+      { name: "yesterday_to_tomorrow", startDate: toISODate(addDays(new Date(), -1)), endDate: toISODate(addDays(new Date(), 1)) },
+    ];
 
-    const result = {
+    const out = {
       ok: true,
       vin,
       dealerId,
       carMeta: { brand: car.brand, model: car.model, year: car.year },
-      period,
-      endpointsTried: [],
-      stockCars: null,
-      hint:
-        "Если везде пусто/404 — значит нужный маркетинг не в stock-cars. Тогда нужен другой раздел API (например calls/leads/ads).",
+      accessMatrix: [],
+      stockCarsChecks: [],
     };
 
-    // 2) stock-cars (точно из доки)
-    if (dealerId) {
-      const stockCars = await safeRequest({
-        method: "POST",
-        url: "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars",
-        token,
-        body: {
-          grouping: "periodDay",
-          dealerIds: [Number(dealerId)],
-          siteSource: null,
-          startDate: period.startDate,
-          endDate: period.endDate,
-        },
-      });
-
-      result.stockCars = {
-        ...stockCars,
-        summary: stockCars.ok ? summarizeStockCars(stockCars.json) : null,
-      };
-    }
-
-    // 3) Автоскан: пробуем “похожие” эндпоинты, которые часто есть в таких API
-    // (не ломает ничего: мы просто проверяем статус/контент)
+    // Матрица доступов (важно для поддержки/CM.Expert)
     const candidates = [
-      // возможные варианты (если существуют — увидим 200/401/403/404)
       { method: "GET",  url: "https://lk.cm.expert/api/v1/marketing-statistics" },
       { method: "GET",  url: "https://lk.cm.expert/api/v1/marketing-statistics/summary" },
       { method: "POST", url: "https://lk.cm.expert/api/v1/marketing-statistics/calls" },
       { method: "POST", url: "https://lk.cm.expert/api/v1/marketing-statistics/leads" },
-      { method: "POST", url: "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars/summary" },
       { method: "POST", url: "https://lk.cm.expert/api/v1/calls/statistics" },
       { method: "POST", url: "https://lk.cm.expert/api/v1/leads/statistics" },
       { method: "POST", url: "https://lk.cm.expert/api/v1/advertising/statistics" },
     ];
 
     for (const c of candidates) {
-      const body =
-        c.method === "POST"
-          ? { dealerIds: dealerId ? [Number(dealerId)] : [], startDate: period.startDate, endDate: period.endDate }
-          : undefined;
+      const body = c.method === "POST"
+        ? { dealerIds: dealerId ? [Number(dealerId)] : [], startDate: periods[0].startDate, endDate: periods[0].endDate }
+        : undefined;
 
       const r = await safeRequest({ method: c.method, url: c.url, token, body });
-      result.endpointsTried.push({
+      out.accessMatrix.push({
         method: c.method,
         url: c.url,
         status: r.status,
-        contentType: r.contentType,
-        isHtml: r.isHtml,
-        ok: r.ok,
         bodyPreview: r.bodyPreview,
       });
     }
 
-    return res.send(JSON.stringify(result));
+    // Проверки stock-cars по разным периодам + по источникам
+    if (dealerId) {
+      const sources = [null, "auto.ru", "avito.ru", "drom.ru"];
+
+      for (const p of periods) {
+        for (const s of sources) {
+          const r = await safeRequest({
+            method: "POST",
+            url: "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars",
+            token,
+            body: {
+              grouping: "periodDay",
+              dealerIds: [Number(dealerId)],
+              siteSource: s,
+              startDate: p.startDate,
+              endDate: p.endDate,
+            },
+          });
+
+          out.stockCarsChecks.push({
+            period: p.name,
+            siteSource: s,
+            status: r.status,
+            ok: r.ok,
+            summary: r.ok ? summarizeStockCars(r.json) : null,
+            bodyPreview: r.bodyPreview,
+          });
+        }
+      }
+    }
+
+    return res.send(JSON.stringify(out));
   } catch (error) {
     const status = error?.response?.status || 500;
     const data = error?.response?.data;
