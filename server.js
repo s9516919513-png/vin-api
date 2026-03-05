@@ -4,199 +4,122 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// axios
-const http = axios.create({ timeout: 20000 });
-
-// CORS
-app.use((req,res,next)=>{
-res.setHeader("Access-Control-Allow-Origin","*");
-res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization");
-res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
-if(req.method==="OPTIONS") return res.sendStatus(200);
-next();
+// axios instance
+const http = axios.create({
+  timeout: 20000
 });
 
+// ---------------- CORS ----------------
+
+app.use((req,res,next)=>{
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type, Authorization");
+  res.setHeader("Access-Control-Allow-Methods","GET,POST,OPTIONS");
+  if(req.method==="OPTIONS") return res.sendStatus(200);
+  next();
+});
+
+// ---------------- HELPERS ----------------
+
 function toISODate(d){
-const x=new Date(d);
-return x.toISOString().slice(0,10);
+  const x = new Date(d);
+  return x.toISOString().slice(0,10);
 }
 
 function addDays(date,days){
-const d=new Date(date);
-d.setDate(d.getDate()+days);
-return d;
+  const d = new Date(date);
+  d.setDate(d.getDate()+days);
+  return d;
 }
 
 // ---------------- TOKEN CACHE ----------------
 
-let tokenCache={token:null,expiresAt:0};
+let tokenCache = {
+  token:null,
+  expiresAt:0
+};
 
 async function getToken(){
 
-const now=Date.now();
+  const now = Date.now();
 
-if(tokenCache.token && now<tokenCache.expiresAt){
-return tokenCache.token;
-}
+  if(tokenCache.token && now < tokenCache.expiresAt - 10000){
+    return tokenCache.token;
+  }
 
-const r=await http.post(
-"https://lk.cm.expert/oauth/token",
-new URLSearchParams({
-grant_type:"client_credentials",
-client_id:process.env.CLIENT_ID,
-client_secret:process.env.CLIENT_SECRET
-}),
-{headers:{'Content-Type':'application/x-www-form-urlencoded'}}
-);
+  const r = await http.post(
+    "https://lk.cm.expert/oauth/token",
+    new URLSearchParams({
+      grant_type:"client_credentials",
+      client_id:process.env.CLIENT_ID,
+      client_secret:process.env.CLIENT_SECRET
+    }),
+    {
+      headers:{
+        "Content-Type":"application/x-www-form-urlencoded"
+      }
+    }
+  );
 
-tokenCache={
-token:r.data.access_token,
-expiresAt:Date.now()+((r.data.expires_in||3600)*1000)
-};
+  tokenCache.token = r.data.access_token;
+  tokenCache.expiresAt = Date.now() + (r.data.expires_in * 1000);
 
-return tokenCache.token;
-}
-
-// ---------------- MARKETING CACHE ----------------
-
-const marketingCache=new Map();
-
-function cacheGet(key){
-const x=marketingCache.get(key);
-if(!x) return null;
-if(Date.now()>x.exp){
-marketingCache.delete(key);
-return null;
-}
-return x.data;
-}
-
-function cacheSet(key,data,ttl=600000){
-marketingCache.set(key,{data,exp:Date.now()+ttl});
+  return tokenCache.token;
 }
 
 // ---------------- MARKETING API ----------------
 
-async function fetchMarketing({token,dealerId,startDate,endDate,siteSource=null}){
+async function fetchMarketing({token,dealerId,startDate,endDate}){
 
-const r=await http.post(
-"https://lk.cm.expert/api/v1/marketing-statistics/stock-cars",
-{
-grouping:"periodDay",
-dealerIds:[dealerId],
-siteSource,
-startDate,
-endDate
-},
-{
-headers:{
-Authorization:`Bearer ${token}`,
-"Content-Type":"application/json"
-}
-}
-);
+  const r = await http.post(
+    "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars",
+    {
+      grouping:"periodDay",
+      dealerIds:[dealerId],
+      siteSource:null,
+      startDate,
+      endDate
+    },
+    {
+      headers:{
+        Authorization:`Bearer ${token}`,
+        "Content-Type":"application/json"
+      }
+    }
+  );
 
-return r.data;
-}
-
-// ---------------- MULTI PERIOD ----------------
-
-async function marketingPeriod({token,dealerId,days}){
-
-const end=new Date();
-let periods=[];
-
-if(days<=30){
-
-periods.push({
-start:toISODate(addDays(end,-days)),
-end:toISODate(end)
-});
-
-}else{
-
-periods.push({
-start:toISODate(addDays(end,-30)),
-end:toISODate(end)
-});
-
-periods.push({
-start:toISODate(addDays(end,-60)),
-end:toISODate(addDays(end,-30))
-});
-
-periods.push({
-start:toISODate(addDays(end,-90)),
-end:toISODate(addDays(end,-60))
-});
-
-}
-
-let totals={
-views:0,
-chats:{total:0,missed:0,targeted:0},
-sumExpenses:0,
-sumWithBonusesExpenses:0
-};
-
-let stats=[];
-
-for(const p of periods){
-
-const data=await fetchMarketing({
-token,
-dealerId,
-startDate:p.start,
-endDate:p.end
-});
-
-if(data.total){
-
-totals.views+=data.total.views||0;
-totals.chats.total+=data.total.chats?.total||0;
-totals.chats.missed+=data.total.chats?.missed||0;
-totals.chats.targeted+=data.total.chats?.targeted||0;
-
-totals.sumExpenses+=data.total.sumExpenses||0;
-totals.sumWithBonusesExpenses+=data.total.sumWithBonusesExpenses||0;
-
-}
-
-if(data.stats){
-stats.push(...data.stats);
-}
-
-}
-
-return {total:totals,stats};
+  return r.data;
 }
 
 // ---------------- HOME ----------------
 
 app.get("/",(req,res)=>{
 
-res.send(`<!DOCTYPE html>
-<html lang="ru">
+res.send(`
+
+<!doctype html>
+<html>
+
 <head>
 
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 
-<title>VIN Аналитика</title>
+<title>VIN аналитика</title>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
 
 body{
-font-family:Inter,Arial;
-background:#f5f6fa;
+font-family:Arial;
+background:#f6f7fb;
 margin:0;
 padding:40px;
 }
 
 .container{
-max-width:1100px;
+max-width:1000px;
 margin:auto;
 }
 
@@ -204,13 +127,8 @@ margin:auto;
 background:white;
 border-radius:16px;
 padding:24px;
+margin-bottom:20px;
 box-shadow:0 10px 30px rgba(0,0,0,.05);
-margin-bottom:20px;
-}
-
-h1{
-font-size:36px;
-margin-bottom:20px;
 }
 
 .grid{
@@ -221,63 +139,22 @@ gap:14px;
 
 .metric{
 background:#fafafa;
-border-radius:12px;
 padding:16px;
+border-radius:10px;
 }
 
 .metric .label{
-font-size:13px;
+font-size:12px;
 color:#777;
 }
 
 .metric .value{
-font-size:24px;
+font-size:22px;
 font-weight:700;
-margin-top:6px;
-}
-
-input{
-width:100%;
-padding:14px;
-border-radius:10px;
-border:1px solid #ddd;
-font-size:16px;
-}
-
-button{
-padding:12px 16px;
-border-radius:10px;
-border:none;
-font-weight:600;
-cursor:pointer;
-}
-
-.primary{
-background:#ff5a2c;
-color:white;
-}
-
-.light{
-background:#eee;
-}
-
-.period{
-display:flex;
-gap:8px;
-margin-top:10px;
 }
 
 .period button{
-background:#eee;
-}
-
-.period button.active{
-background:#111;
-color:white;
-}
-
-.chart{
-margin-top:30px;
+margin-right:6px;
 }
 
 </style>
@@ -292,19 +169,19 @@ margin-top:30px;
 
 <div class="card">
 
-<input id="vin" placeholder="Введите VIN (17 символов)">
+<input id="vin" placeholder="Введите VIN" style="width:100%;padding:10px">
 
 <div style="margin-top:10px">
 
-<button class="primary" onclick="checkVin()">Проверить VIN</button>
-<button class="light" onclick="reset()">Очистить</button>
+<button onclick="checkVin()">Проверить VIN</button>
+<button onclick="reset()">Очистить</button>
 
 </div>
 
-<div class="period">
+<div class="period" style="margin-top:10px">
 
 <button onclick="setPeriod(7)">7 дней</button>
-<button class="active" onclick="setPeriod(30)">30 дней</button>
+<button onclick="setPeriod(30)">30 дней</button>
 <button onclick="setPeriod(90)">90 дней</button>
 
 </div>
@@ -322,30 +199,20 @@ let period=30
 let chart=null
 
 function setPeriod(p){
-
 period=p
-
-document.querySelectorAll(".period button").forEach(b=>b.classList.remove("active"))
-event.target.classList.add("active")
-
-if(dealerId) loadMarketing()
-
+if(dealerId){
+loadMarketing()
+}
 }
 
 function reset(){
-
 document.getElementById("vin").value=""
 document.getElementById("result").innerHTML=""
 dealerId=null
-
 }
 
 function format(x){
 return Number(x).toLocaleString("ru-RU")
-}
-
-function money(x){
-return format(x)+" ₽"
 }
 
 async function checkVin(){
@@ -353,41 +220,41 @@ async function checkVin(){
 const vin=document.getElementById("vin").value
 
 const r=await fetch("/check-vin?vin="+vin)
-const d=await r.json()
+const data=await r.json()
 
-if(!d.ok){
-alert(d.message)
+if(!data.ok){
+alert(data.message)
 return
 }
 
-dealerId=d.dealerId
+dealerId=data.dealerId
 
 document.getElementById("result").innerHTML=\`
 
 <div class="card">
 
-<h2>\${d.brand} \${d.model} \${d.year}</h2>
+<h2>\${data.brand} \${data.model} \${data.year}</h2>
 
 <div class="grid">
 
 <div class="metric">
 <div class="label">Комплектация</div>
-<div class="value">\${d.equipmentName||"—"}</div>
+<div class="value">\${data.equipmentName||"-"}</div>
 </div>
 
 <div class="metric">
 <div class="label">Модификация</div>
-<div class="value">\${d.modificationName||"—"}</div>
+<div class="value">\${data.modificationName||"-"}</div>
 </div>
 
 <div class="metric">
 <div class="label">Пробег</div>
-<div class="value">\${format(d.mileage)} км</div>
+<div class="value">\${format(data.mileage)} км</div>
 </div>
 
 <div class="metric">
 <div class="label">Цвет</div>
-<div class="value">\${d.color||"—"}</div>
+<div class="value">\${data.color||"-"}</div>
 </div>
 
 </div>
@@ -404,23 +271,23 @@ loadMarketing()
 
 async function loadMarketing(){
 
-document.getElementById("marketing").innerHTML="Загрузка маркетинга..."
+document.getElementById("marketing").innerHTML="Загрузка..."
 
 const r=await fetch("/marketing?dealerId="+dealerId+"&days="+period)
-const d=await r.json()
+const data=await r.json()
 
-if(!d.ok){
-document.getElementById("marketing").innerHTML="Ошибка маркетинга"
+if(!data.ok){
+document.getElementById("marketing").innerHTML="Ошибка загрузки"
 return
 }
 
-const m=d.marketing
+const m=data.marketing
 
 document.getElementById("marketing").innerHTML=\`
 
 <div class="card">
 
-<h3>Маркетинг за \${period} дней</h3>
+<h3>Маркетинг</h3>
 
 <div class="grid">
 
@@ -436,12 +303,12 @@ document.getElementById("marketing").innerHTML=\`
 
 <div class="metric">
 <div class="label">Расходы</div>
-<div class="value">\${money(m.total.sumWithBonusesExpenses)}</div>
+<div class="value">\${format(m.total.sumWithBonusesExpenses)} ₽</div>
 </div>
 
 </div>
 
-<canvas id="chart" class="chart"></canvas>
+<canvas id="chart"></canvas>
 
 </div>
 
@@ -460,14 +327,8 @@ type:"line",
 data:{
 labels,
 datasets:[
-{
-label:"Просмотры",
-data:views
-},
-{
-label:"Чаты",
-data:chats
-}
+{label:"Просмотры",data:views},
+{label:"Чаты",data:chats}
 ]
 }
 })
@@ -477,28 +338,28 @@ data:chats
 </script>
 
 </body>
-</html>`);
+</html>
+
+`);
 });
 
 // ---------------- VIN ----------------
 
 app.get("/check-vin",async(req,res)=>{
 
-const vin=req.query.vin;
-
 try{
 
-const token=await getToken();
+const token = await getToken()
 
-const r=await http.get(
+const r = await http.get(
 "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
 {
-params:{vin},
+params:{vin:req.query.vin},
 headers:{Authorization:\`Bearer \${token}\`}
 }
-);
+)
 
-const c=r.data;
+const c = r.data
 
 res.json({
 ok:true,
@@ -510,56 +371,58 @@ modificationName:c.modificationName,
 mileage:c.mileage,
 color:c.color,
 dealerId:c.dealerId
-});
+})
 
 }catch(e){
 
 res.json({
 ok:false,
-message:e.response?.data?.message||e.message
-});
+message:e.response?.data?.message || e.message
+})
 
 }
 
-});
+})
 
 // ---------------- MARKETING ----------------
 
 app.get("/marketing",async(req,res)=>{
 
-const dealerId=req.query.dealerId;
-const days=Number(req.query.days||30);
-
-const key=dealerId+"_"+days;
-
-const cached=cacheGet(key);
-if(cached){
-return res.json({ok:true,marketing:cached});
-}
-
 try{
 
-const token=await getToken();
+const token = await getToken()
 
-const data=await marketingPeriod({
+const dealerId = req.query.dealerId
+const days = Number(req.query.days || 30)
+
+const startDate = toISODate(addDays(new Date(),-days))
+const endDate = toISODate(new Date())
+
+const data = await fetchMarketing({
 token,
 dealerId,
-days
-});
+startDate,
+endDate
+})
 
-cacheSet(key,data);
-
-res.json({ok:true,marketing:data});
+res.json({
+ok:true,
+marketing:data
+})
 
 }catch(e){
 
 res.json({
 ok:false,
-message:e.response?.data?.message||e.message
-});
+message:e.response?.data?.message || e.message
+})
 
 }
 
-});
+})
 
-app.listen(PORT,()=>console.log("Server running "+PORT));
+// ---------------- START ----------------
+
+app.listen(PORT,"0.0.0.0",()=>{
+console.log("Server running on",PORT)
+})
