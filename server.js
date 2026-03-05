@@ -33,7 +33,6 @@ function safeNum(v) {
   return Number.isFinite(n) ? n : null;
 }
 function pickStockCardId(carObj) {
-  // 1) прямые поля (самые вероятные)
   const directKeys = ["stockCardId", "stock_card_id", "stockCardID", "stockcardid"];
   for (const k of directKeys) {
     if (carObj && Object.prototype.hasOwnProperty.call(carObj, k)) {
@@ -41,8 +40,6 @@ function pickStockCardId(carObj) {
       if (n != null) return { value: n, path: k };
     }
   }
-
-  // 2) рекурсивный поиск (на случай вложенных структур)
   const seen = new Set();
   function walk(node, path) {
     if (!node || typeof node !== "object") return null;
@@ -63,23 +60,18 @@ function pickStockCardId(carObj) {
         if (n != null) return { value: n, path: `${path}.${k}`.replace(/^\./, "") };
       }
     }
-
     for (const [k, v] of Object.entries(node)) {
       const r = walk(v, `${path}.${k}`.replace(/^\./, ""));
       if (r) return r;
     }
     return null;
   }
-
   return walk(carObj, "");
 }
 function normalizeStatsEntry(entry) {
   if (!entry || typeof entry !== "object") return null;
-
-  // Вариант 1: entry.total содержит поля
   if (entry.total && typeof entry.total === "object") return entry.total;
 
-  // Вариант 2: поля лежат прямо в entry (на разных версиях swagger так бывает)
   const maybe = {};
   const keys = [
     "views",
@@ -101,6 +93,15 @@ function normalizeStatsEntry(entry) {
     }
   }
   return found ? maybe : null;
+}
+function extractPerCarTotal(marketingData, stockCardId) {
+  const stats = Array.isArray(marketingData?.stats) ? marketingData.stats : [];
+  const idNum = Number(stockCardId);
+  const row =
+    stats.find((x) => Number(x?.groupBy) === idNum) ||
+    stats.find((x) => String(x?.groupBy) === String(stockCardId));
+  if (!row) return null;
+  return normalizeStatsEntry(row);
 }
 
 // -------------------- token cache --------------------
@@ -126,18 +127,12 @@ async function getToken() {
   return token;
 }
 
-// -------------------- marketing API (по доке) --------------------
-async function fetchMarketingStockCars({ token, dealerId, siteSource, startDate, endDate }) {
-  // По твоему Swagger:
-  // grouping: enum включает "stockCardId" и "periodDay"
-  // dealerIds: Array[integer] (min 1)
-  // siteSource: null | "auto.ru" | "avito.ru" | "drom.ru"
-  // startDate/endDate: YYYY-MM-DD, startDate минимум -31 день от endDate
-
+// -------------------- marketing API --------------------
+async function fetchMarketingStockCars({ token, dealerId, siteSource, startDate, endDate, grouping }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
   const body = {
-    grouping: "stockCardId",
+    grouping, // "stockCardId" или "periodDay"
     dealerIds: [Number(dealerId)],
     siteSource: siteSource ?? null,
     startDate,
@@ -150,7 +145,6 @@ async function fetchMarketingStockCars({ token, dealerId, siteSource, startDate,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
-    // важно: если API вернет HTML/ошибку прокси — поймаем как текст в catch ниже
     responseType: "json",
     validateStatus: () => true,
   });
@@ -159,38 +153,12 @@ async function fetchMarketingStockCars({ token, dealerId, siteSource, startDate,
     return { ok: true, data: r.data, request: { url, body } };
   }
 
-  // иногда API может вернуть html в data как строку — дадим понятную ошибку
   const details =
     (typeof r.data === "string" ? r.data.slice(0, 400) : r.data?.message || r.data?.error) ||
     `HTTP ${r.status}`;
 
   return { ok: false, error: "Marketing API error", status: r.status, details, request: { url, body } };
 }
-
-function extractPerCarTotal(marketingData, stockCardId) {
-  const stats = Array.isArray(marketingData?.stats) ? marketingData.stats : [];
-  const idNum = Number(stockCardId);
-
-  // groupBy в доке — значение, по которому сгруппировано. Для grouping stockCardId там будет stockCardId.
-  const row =
-    stats.find((x) => Number(x?.groupBy) === idNum) ||
-    stats.find((x) => String(x?.groupBy) === String(stockCardId));
-
-  if (!row) return null;
-
-  return normalizeStatsEntry(row);
-}
-
-// -------------------- logo: /logo --------------------
-const AUTOPORTRAIT_LOGO_B64 =
-  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAoHBwgHBhYICAgWFhYVGBcaGBUYGSAeGhcYHRkdHRkfHx8jIi0lHx4oHh8XJTUlKS0vMjIyHSI4PTcwPS4xMi8BCgoKDg0OGxAQGy0lICUtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAWgB4AMBIgACEQEDEQH/xAAbAAACAgMBAAAAAAAAAAAAAAADBAUCBgEHAf/EADoQAAIBAgQDBgMGBwAAAAAAAAECAwQRAAUSITFBBhMiUWEHFDKBkaGxByNCUmLB0SNTYoKy8RVDc4L/xAAYAQADAQEAAAAAAAAAAAAAAAAAAQAFAgP/xAAgEQADAQEBAAIDAQAAAAAAAAAAAQIRAyESMQQiQVFh/9oADAMBAAIRAxEAPwD1yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k=";
-
-app.get("/logo", (req, res) => {
-  const img = Buffer.from(AUTOPORTRAIT_LOGO_B64, "base64");
-  res.setHeader("Content-Type", "image/jpeg");
-  res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-  res.status(200).send(img);
-});
 
 // -------------------- routes --------------------
 app.get("/health", (req, res) => res.json({ ok: true }));
@@ -220,9 +188,6 @@ app.get("/", (req, res) => {
     }
     .wrap{max-width:1120px; margin:34px auto; padding:0 16px;}
     .topbar{display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:16px;}
-    .brand{display:flex; align-items:center; gap:12px;}
-    .logo{width:42px; height:42px; border-radius:12px; box-shadow: 0 10px 22px rgba(10,63,71,.18); overflow:hidden; background:#08333a; display:flex; align-items:center; justify-content:center;}
-    .logo img{width:100%; height:100%; object-fit:cover;}
     .brandText{line-height:1.05}
     .brandText .name{font-size:14px; font-weight:900; letter-spacing:.12em; text-transform:uppercase; color:var(--brand);}
     .brandText .sub{font-size:12px; color:var(--muted); margin-top:4px}
@@ -279,6 +244,7 @@ app.get("/", (req, res) => {
     .kv .k{color:var(--muted); font-size:12px}
     .kv .v{font-weight:900; font-size:13px}
     .error{padding:14px 16px; border-radius:16px; border:1px solid rgba(240,68,56,.25); background:rgba(240,68,56,.07); color:#7a271a; font-weight:800;}
+    .warn{padding:12px 14px; border-radius:14px; background:rgba(247,144,9,.10); border:1px solid rgba(247,144,9,.22); color:#7a4b00; font-weight:800; margin-top:10px;}
     .details{margin-top:10px; padding:12px 14px; border-radius:14px; background:rgba(240,68,56,.06); border:1px solid rgba(240,68,56,.16); color:#7a271a; font-size:12px; white-space:pre-wrap; font-weight:600;}
     .skeleton{padding:18px; color:var(--muted); font-weight:800;}
     .footer{margin-top:14px; padding:14px 0 0; color:rgba(102,112,133,.92); font-size:12px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;}
@@ -288,12 +254,9 @@ app.get("/", (req, res) => {
 <body>
   <div class="wrap">
     <div class="topbar">
-      <div class="brand">
-        <div class="logo"><img alt="Автопортрет" src="/logo"/></div>
-        <div class="brandText">
-          <div class="name">Автопортрет</div>
-          <div class="sub">Проверка автомобиля по VIN · Маркетинг (по stockCardId)</div>
-        </div>
+      <div class="brandText">
+        <div class="name">Автопортрет</div>
+        <div class="sub">Проверка автомобиля по VIN · Маркетинг (stockCardId → fallback periodDay)</div>
       </div>
       <div class="badge"><span class="dot"></span> API online · период: последние 30 дней</div>
     </div>
@@ -301,7 +264,7 @@ app.get("/", (req, res) => {
     <div class="card hero">
       <div class="heroLeft">
         <h1>VIN-проверка</h1>
-        <p>Маркетинг получаем по <b>stockCardId</b> (как в инструкции). API ограничивает период ~31 день — используем последние <b>30 дней</b>.</p>
+        <p>Сначала пробуем маркетинг по <b>stockCardId</b> (как в доке). Если stockCardId не приходит из find-last-by-car — показываем маркетинг по дилеру (grouping: <b>periodDay</b>), чтобы данные не были пустыми.</p>
       </div>
     </div>
 
@@ -389,20 +352,23 @@ function renderMarketing(marketing){
   const chats = total.chats || {};
   const sum = (total.sumWithBonusesExpenses ?? total.sumExpenses);
 
+  const warn = marketing.warning ? '<div class="warn">' + esc(marketing.warning) + '</div>' : '';
+
   return \`
     <div class="section">
       <div class="sectionTitle">Маркетинг</div>
       <div class="meta">
         <span class="pill"><span class="k">Период</span> <b>\${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)}</b></span>
-        <span class="pill"><span class="k">grouping</span> <b>\${esc(marketing.grouping || 'stockCardId')}</b></span>
-        <span class="pill"><span class="k">stockCardId</span> <b>\${esc(marketing.stockCardId ?? '—')}</b></span>
+        <span class="pill"><span class="k">grouping</span> <b>\${esc(marketing.grouping || 'periodDay')}</b></span>
+        <span class="pill"><span class="k">Режим</span> <b>\${esc(marketing.mode || 'unknown')}</b></span>
       </div>
+      \${warn}
 
       <div class="marketingGrid">
         <div class="metric">
           <div class="label">Просмотры</div>
           <div class="value">\${formatNum(total.views)}</div>
-          <div class="subv">По конкретной карточке.</div>
+          <div class="subv">Totals за период.</div>
         </div>
         <div class="metric">
           <div class="label">Чаты</div>
@@ -412,7 +378,7 @@ function renderMarketing(marketing){
         <div class="metric">
           <div class="label">Расходы всего (с бонусами)</div>
           <div class="value">\${sum != null ? formatMoney(sum) : '—'}</div>
-          <div class="subv">Суммарно по карточке.</div>
+          <div class="subv">Totals за период.</div>
         </div>
         <div class="metric">
           <div class="label">Структура расходов</div>
@@ -502,7 +468,7 @@ async function checkVin(){
 </html>`);
 });
 
-// VIN -> авто + маркетинг по stockCardId
+// -------------------- /check-vin --------------------
 app.get("/check-vin", async (req, res) => {
   res.type("json");
 
@@ -521,11 +487,11 @@ app.get("/check-vin", async (req, res) => {
     const c = carResponse.data || {};
     const dealerId = c.dealerId ?? null;
 
-    // 2) stockCardId (ключ для правильной выборки из marketing.stats[])
+    // 2) stockCardId если есть
     const foundStockCard = pickStockCardId(c);
     const stockCardId = foundStockCard?.value ?? null;
 
-    // период строго 30 дней (по доке)
+    // период строго 30 дней (ограничение API)
     const endDate = toISODate(new Date());
     const startDate = toISODate(addDays(new Date(), -30));
 
@@ -533,14 +499,13 @@ app.get("/check-vin", async (req, res) => {
 
     if (!dealerId) {
       marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
-    } else if (!stockCardId) {
-      marketing = {
-        ok: false,
-        message: "Не найден stockCardId в ответе find-last-by-car — по доке он нужен для группировки",
-        details: "Проверь, что find-last-by-car возвращает stockCardId (иногда он вложен).",
-      };
     } else {
-      // базовый маркетинг (siteSource: null) + классифайды
+      // Ветка A: есть stockCardId -> grouping stockCardId (по доке)
+      // Ветка B: нет stockCardId -> fallback grouping periodDay (по дилеру), чтобы не было пусто
+      const mode = stockCardId ? "by-stockCardId" : "fallback-dealer-periodDay";
+
+      const baseGrouping = stockCardId ? "stockCardId" : "periodDay";
+
       const sources = [null, "auto.ru", "avito.ru", "drom.ru"];
       const results = await Promise.all(
         sources.map((s) =>
@@ -550,6 +515,7 @@ app.get("/check-vin", async (req, res) => {
             siteSource: s,
             startDate,
             endDate,
+            grouping: baseGrouping,
           })
         )
       );
@@ -562,10 +528,16 @@ app.get("/check-vin", async (req, res) => {
           details: base.details || base.error || "Unknown",
         };
       } else {
-        // ВНИМАНИЕ: берём НЕ total, а строку из stats[] по groupBy==stockCardId
-        const perCarTotal = extractPerCarTotal(base.data, stockCardId);
+        let total = null;
 
-        // классифайды: то же самое
+        if (stockCardId) {
+          // Правильно: берём из stats[] по groupBy==stockCardId
+          total = extractPerCarTotal(base.data, stockCardId);
+        } else {
+          // Fallback: берём агрегатный total по дилеру
+          total = base.data?.total || null;
+        }
+
         const bySource = {};
         const srcKeys = ["auto.ru", "avito.ru", "drom.ru"];
         for (let i = 0; i < srcKeys.length; i++) {
@@ -573,7 +545,7 @@ app.get("/check-vin", async (req, res) => {
           if (rr.ok) {
             bySource[srcKeys[i]] = {
               ok: true,
-              total: extractPerCarTotal(rr.data, stockCardId),
+              total: stockCardId ? extractPerCarTotal(rr.data, stockCardId) : rr.data?.total || null,
             };
           } else {
             bySource[srcKeys[i]] = { ok: false, total: null };
@@ -582,14 +554,17 @@ app.get("/check-vin", async (req, res) => {
 
         marketing = {
           ok: true,
-          grouping: "stockCardId",
+          mode,
+          grouping: baseGrouping,
           period: { startDate, endDate },
-          stockCardId,
-          total: perCarTotal, // <-- правильные данные по карточке
+          stockCardId: stockCardId ?? null,
+          total,
           bySource,
+          warning: stockCardId
+            ? null
+            : "stockCardId не приходит из find-last-by-car → показаны агрегированные данные по дилеру (grouping: periodDay).",
           debug: {
             stockCardIdFoundAt: foundStockCard?.path || null,
-            note: "total взят из data.stats[] (groupBy==stockCardId), а не из data.total",
           },
         };
       }
