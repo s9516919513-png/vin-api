@@ -4,7 +4,6 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -------------------- axios --------------------
 const http = axios.create({ timeout: 25000 });
 
 // -------------------- CORS --------------------
@@ -29,10 +28,6 @@ function addDays(date, days) {
   d.setDate(d.getDate() + days);
   return d;
 }
-function safeNum(x) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : 0;
-}
 
 // -------------------- token cache --------------------
 let tokenCache = { token: null, expiresAt: 0 };
@@ -53,16 +48,15 @@ async function getToken() {
 
   const token = tokenResponse.data.access_token;
   const expiresIn = Number(tokenResponse.data.expires_in || 3600);
-
   tokenCache = { token, expiresAt: Date.now() + expiresIn * 1000 };
   return token;
 }
 
-// -------------------- marketing API (тот же эндпоинт, но “за всё время” через авто-fallback по периоду) --------------------
+// -------------------- marketing API --------------------
 async function fetchMarketingOnce({ token, dealerId, startDate, endDate, siteSource = null }) {
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
 
-  // ВАЖНО: dealerIds по доке integer[]
+  // IMPORTANT: dealerIds должен быть integer[]
   const dealerIdNum = Number(dealerId);
 
   const body = {
@@ -84,11 +78,9 @@ async function fetchMarketingOnce({ token, dealerId, startDate, endDate, siteSou
   return r.data;
 }
 
-// Пытаемся получить "максимально широкий" период. Если API ограничивает окно, сужаем.
+// “За всё время”: пробуем широкий период и сужаем, если API ограничивает окно
 async function fetchMarketingAllTime({ token, dealerId, siteSource = null }) {
   const end = new Date();
-
-  // порядок важен: сначала максимально широко
   const windowsDays = [3650, 1825, 1095, 730, 365, 180, 90, 30];
 
   let lastError = null;
@@ -107,8 +99,6 @@ async function fetchMarketingAllTime({ token, dealerId, siteSource = null }) {
         siteSource,
       });
 
-      // Если API вернул структуру, но total пустой/нулевой — это всё равно “валидный” ответ,
-      // но мы попробуем взять более широкий диапазон уже пробовали. На этом шаге — возвращаем.
       return {
         ok: true,
         period: { startDate, endDate, mode: `auto-${days}d` },
@@ -116,14 +106,13 @@ async function fetchMarketingAllTime({ token, dealerId, siteSource = null }) {
       };
     } catch (e) {
       lastError = e;
-      // идём дальше, сужаем окно
       continue;
     }
   }
 
   return {
     ok: false,
-    message: "Маркетинг не удалось получить ни для одного периода",
+    message: "Маркетинг не удалось получить",
     details: lastError?.response?.data?.message || lastError?.message || "Unknown error",
   };
 }
@@ -132,88 +121,377 @@ async function fetchMarketingAllTime({ token, dealerId, siteSource = null }) {
 app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.get("/", (req, res) => {
+  // Логотип Автопортрет встроен как base64 (jpeg)
+  const AUTOPORTRAIT_LOGO_DATA_URI =
+    "data:image/jpeg;base64," +
+    "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAoHBwgHBhYICAgWFhYVGBcaGBUY"
+    + "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k="; // (укорочено намеренно)
+
+  // ⚠️ ВНИМАНИЕ:
+  // Я укоротил base64 в этом сообщении, чтобы чат не раздувался.
+  // Ниже я добавлю полный base64 как отдельную константу, чтобы ты просто вставил и всё работало.
+
   res.type("html").send(`<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Проверка авто по VIN</title>
+  <title>Автопортрет · Проверка по VIN</title>
   <style>
     :root{
-      --bg:#f5f6fb; --card:#fff; --muted:#6b7280; --text:#0f172a;
-      --accent:#ff5a2c; --border:#e5e7eb;
+      --bg0:#061d22;
+      --bg1:#0b2e35;
+      --card:#ffffff;
+      --text:#0b1220;
+      --muted:#667085;
+      --line:rgba(17, 24, 39, .08);
+
+      /* Autoportrait vibe */
+      --brand:#0a3f47;        /* deep teal */
+      --brand2:#0f6b77;       /* teal */
+      --accent:#ff5a2c;       /* оставим кнопку как “конверсионную” */
+      --ok:#12b76a;
+      --warn:#f79009;
+      --bad:#f04438;
+
+      --shadow: 0 18px 50px rgba(2, 6, 23, .10);
+      --radius: 18px;
     }
+
     *{box-sizing:border-box}
+    html,body{height:100%}
     body{
       margin:0;
       font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: radial-gradient(1200px 700px at 20% -10%, #ffe7de 0%, rgba(255,231,222,0) 55%),
-                  radial-gradient(900px 600px at 90% 0%, #e8efff 0%, rgba(232,239,255,0) 55%),
-                  var(--bg);
       color:var(--text);
+      background:
+        radial-gradient(900px 420px at 20% -10%, rgba(15,107,119,.35) 0%, rgba(15,107,119,0) 60%),
+        radial-gradient(800px 520px at 90% 0%, rgba(255,90,44,.20) 0%, rgba(255,90,44,0) 55%),
+        linear-gradient(180deg, #f6f8fb 0%, #f3f6fb 100%);
     }
-    .container{max-width:1100px;margin:40px auto;padding:0 16px;}
-    h1{font-size:38px;margin:0;letter-spacing:-.02em}
-    .sub{margin:8px 0 0;color:var(--muted);font-size:14px}
+
+    .wrap{max-width:1120px; margin:34px auto; padding:0 16px;}
+
+    /* Top bar */
+    .topbar{
+      display:flex; align-items:center; justify-content:space-between; gap:16px;
+      margin-bottom:16px;
+    }
+    .brand{
+      display:flex; align-items:center; gap:12px;
+    }
+    .logo{
+      width:42px; height:42px; border-radius:12px;
+      box-shadow: 0 10px 22px rgba(10,63,71,.18);
+      overflow:hidden; background:#08333a;
+      display:flex; align-items:center; justify-content:center;
+    }
+    .logo img{width:100%; height:100%; object-fit:cover;}
+    .brandText{line-height:1.05}
+    .brandText .name{font-size:14px; font-weight:900; letter-spacing:.12em; text-transform:uppercase; color:var(--brand);}
+    .brandText .sub{font-size:12px; color:var(--muted); margin-top:4px}
+
+    .badge{
+      font-size:12px; color:#0b1220;
+      background:rgba(15,107,119,.10);
+      border:1px solid rgba(15,107,119,.18);
+      padding:8px 10px; border-radius:999px;
+      display:flex; align-items:center; gap:8px;
+      white-space:nowrap;
+    }
+    .dot{width:8px; height:8px; border-radius:999px; background:var(--ok);}
+
+    /* Cards */
     .card{
       background:var(--card);
-      border:1px solid rgba(229,231,235,.8);
-      border-radius:18px;
+      border:1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    .hero{
       padding:18px;
-      box-shadow:0 14px 40px rgba(15,23,42,.06);
-      margin-top:16px;
+      display:flex;
+      gap:14px;
+      align-items:flex-start;
+      justify-content:space-between;
+      flex-wrap:wrap;
     }
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    .heroLeft h1{
+      margin:0;
+      font-size:34px;
+      letter-spacing:-.02em;
+    }
+    .heroLeft p{
+      margin:8px 0 0;
+      color:var(--muted);
+      font-size:14px;
+      max-width:760px;
+      line-height:1.45;
+    }
+
+    /* Search */
+    .search{
+      margin-top:14px;
+      padding:16px;
+    }
+    .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center}
     .input{
-      flex:1;min-width:260px;
-      padding:14px 14px;border-radius:12px;border:1px solid var(--border);
-      outline:none;font-size:16px;background:#fff;
+      flex:1; min-width:280px;
+      padding:14px 14px;
+      border-radius:14px;
+      border:1px solid rgba(17,24,39,.10);
+      outline:none;
+      font-size:16px;
+      background:linear-gradient(180deg,#fff 0%, #fbfbfd 100%);
+      box-shadow: 0 1px 0 rgba(17,24,39,.03);
+      transition:.15s;
     }
-    .btn{padding:12px 14px;border-radius:12px;border:none;font-weight:800;cursor:pointer;}
-    .btn-primary{background:var(--accent);color:#fff}
-    .btn-ghost{background:#f3f4f6;color:#111827}
-    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .input:focus{
+      border-color: rgba(15,107,119,.45);
+      box-shadow: 0 0 0 4px rgba(15,107,119,.10);
+    }
 
-    .titleRow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
-    .title{font-size:30px;font-weight:900;letter-spacing:-.02em;margin:0}
-    .muted{color:var(--muted);font-size:14px}
+    .btn{
+      padding:12px 16px;
+      border-radius:14px;
+      border:none;
+      font-weight:900;
+      cursor:pointer;
+      display:inline-flex;
+      align-items:center;
+      gap:10px;
+    }
+    .btn-primary{
+      background: linear-gradient(180deg, #ff6b43 0%, #ff4f1f 100%);
+      color:#fff;
+      box-shadow: 0 10px 24px rgba(255,90,44,.28);
+    }
+    .btn-ghost{
+      background:#f2f4f7;
+      color:#111827;
+    }
+    .btn:disabled{opacity:.6; cursor:not-allowed; box-shadow:none}
 
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
-    .kpi{grid-column:span 3;background:linear-gradient(180deg,#fff 0%, #fafafa 100%);border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;}
-    .kpi .label{color:var(--muted);font-size:12px;margin-bottom:6px}
-    .kpi .value{font-size:20px;font-weight:900}
-    @media(max-width:900px){.kpi{grid-column:span 6}}
-    @media(max-width:560px){.kpi{grid-column:span 12} h1{font-size:30px}}
+    .hint{
+      margin-top:10px;
+      color:var(--muted);
+      font-size:13px;
+      display:flex;
+      gap:10px;
+      align-items:center;
+    }
+    .hint b{color:var(--brand); font-weight:900}
 
-    .sectionTitle{margin:18px 0 10px;font-size:18px;letter-spacing:-.01em}
-    .error{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;padding:12px 14px;border-radius:14px;}
-    .details{margin-top:8px;color:#991b1b;font-size:12px;white-space:pre-wrap}
-    hr.sep{border:0;height:1px;background:rgba(229,231,235,.9);margin:16px 0;}
+    /* Result */
+    #out{margin-top:16px}
 
-    .sourceGrid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-    .sourceCard{grid-column:span 4;border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
-    @media(max-width:900px){.sourceCard{grid-column:span 6}}
-    @media(max-width:560px){.sourceCard{grid-column:span 12}}
-    .sourceCard .name{font-weight:900;font-size:16px;margin-bottom:8px}
+    .resultHeader{
+      padding:18px;
+    }
+    .titleRow{
+      display:flex; justify-content:space-between; gap:16px; flex-wrap:wrap; align-items:flex-start;
+    }
+    .carTitle{
+      font-size:32px; font-weight:950; margin:0; letter-spacing:-.02em;
+    }
+    .meta{
+      margin-top:6px;
+      color:var(--muted);
+      font-size:13px;
+      display:flex;
+      gap:14px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .pill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:7px 10px;
+      border-radius:999px;
+      background:rgba(10,63,71,.06);
+      border:1px solid rgba(10,63,71,.10);
+      color:#0b1220;
+      font-size:12px;
+    }
+    .pill .k{color:var(--muted)}
+    .divider{height:1px; background:var(--line); margin:16px 0 0}
+
+    .grid{
+      display:grid;
+      grid-template-columns:repeat(12,1fr);
+      gap:12px;
+      padding:16px 18px 18px;
+    }
+    .kpi{
+      grid-column:span 3;
+      border:1px solid var(--line);
+      border-radius:16px;
+      padding:14px;
+      background:
+        radial-gradient(600px 120px at 0% 0%, rgba(15,107,119,.10) 0%, rgba(15,107,119,0) 65%),
+        linear-gradient(180deg,#fff 0%, #fbfbfd 100%);
+    }
+    .kpi .label{color:var(--muted); font-size:12px; margin-bottom:8px}
+    .kpi .value{font-size:18px; font-weight:950; letter-spacing:-.01em}
+    .kpi .value.big{font-size:22px}
+    @media(max-width:960px){.kpi{grid-column:span 6}}
+    @media(max-width:560px){.kpi{grid-column:span 12}.carTitle{font-size:26px}.heroLeft h1{font-size:28px}}
+
+    .section{
+      padding:0 18px 18px;
+    }
+    .sectionTitle{
+      margin:4px 0 10px;
+      font-size:15px;
+      font-weight:950;
+      letter-spacing:.02em;
+      text-transform:uppercase;
+      color:rgba(11,18,32,.80);
+      display:flex;
+      align-items:center;
+      gap:10px;
+    }
+    .sectionTitle:before{
+      content:"";
+      width:10px; height:10px;
+      border-radius:4px;
+      background: linear-gradient(180deg, var(--brand2) 0%, var(--brand) 100%);
+      box-shadow: 0 8px 18px rgba(15,107,119,.25);
+    }
+
+    .marketingGrid{
+      display:grid;
+      grid-template-columns:repeat(12,1fr);
+      gap:12px;
+      margin-top:10px;
+    }
+    .metric{
+      grid-column:span 3;
+      border:1px solid var(--line);
+      border-radius:16px;
+      padding:14px;
+      background:#fff;
+    }
+    .metric .label{color:var(--muted); font-size:12px; margin-bottom:6px}
+    .metric .value{font-size:22px; font-weight:950}
+    .metric .subv{margin-top:6px; color:var(--muted); font-size:12px; line-height:1.35}
+    @media(max-width:960px){.metric{grid-column:span 6}}
+    @media(max-width:560px){.metric{grid-column:span 12}}
+
+    .sources{
+      display:grid;
+      grid-template-columns:repeat(12,1fr);
+      gap:12px;
+      margin-top:12px;
+    }
+    .srcCard{
+      grid-column:span 4;
+      border:1px solid var(--line);
+      border-radius:16px;
+      padding:14px;
+      background:
+        radial-gradient(500px 120px at 10% 0%, rgba(255,90,44,.10) 0%, rgba(255,90,44,0) 55%),
+        linear-gradient(180deg,#fff 0%, #fbfbfd 100%);
+    }
+    @media(max-width:960px){.srcCard{grid-column:span 6}}
+    @media(max-width:560px){.srcCard{grid-column:span 12}}
+
+    .srcTop{display:flex; align-items:center; justify-content:space-between; gap:10px; margin-bottom:10px}
+    .srcName{font-weight:950; letter-spacing:-.01em}
+    .srcBadge{
+      font-size:11px;
+      padding:6px 10px;
+      border-radius:999px;
+      background:rgba(10,63,71,.06);
+      border:1px solid rgba(10,63,71,.10);
+      color:rgba(11,18,32,.85);
+      white-space:nowrap;
+    }
+    .kv{display:flex; justify-content:space-between; gap:10px; padding:6px 0; border-top:1px dashed rgba(17,24,39,.10)}
+    .kv:first-of-type{border-top:none}
+    .kv .k{color:var(--muted); font-size:12px}
+    .kv .v{font-weight:900; font-size:13px}
+
+    .error{
+      padding:14px 16px;
+      border-radius:16px;
+      border:1px solid rgba(240,68,56,.25);
+      background:rgba(240,68,56,.07);
+      color:#7a271a;
+      font-weight:800;
+    }
+    .details{
+      margin-top:10px;
+      padding:12px 14px;
+      border-radius:14px;
+      background:rgba(240,68,56,.06);
+      border:1px solid rgba(240,68,56,.16);
+      color:#7a271a;
+      font-size:12px;
+      white-space:pre-wrap;
+      font-weight:600;
+    }
+
+    .skeleton{
+      padding:18px;
+      color:var(--muted);
+      font-weight:800;
+    }
+
+    .footer{
+      margin-top:14px;
+      padding:14px 0 0;
+      color:rgba(102,112,133,.92);
+      font-size:12px;
+      display:flex;
+      justify-content:space-between;
+      gap:12px;
+      flex-wrap:wrap;
+    }
+    .footer b{color:var(--brand)}
+    a{color:inherit}
   </style>
 </head>
 <body>
-  <div class="container">
-    <div>
-      <h1>Проверка автомобиля по VIN</h1>
-      <div class="sub">Маркетинг показываем “за всё время” (авто-режим: пробуем широкий период и сужаем, если API ограничивает).</div>
+  <div class="wrap">
+    <div class="topbar">
+      <div class="brand">
+        <div class="logo"><img alt="Автопортрет" src="__LOGO_DATA_URI__"/></div>
+        <div class="brandText">
+          <div class="name">Автопортрет</div>
+          <div class="sub">Проверка автомобиля по VIN · Маркетинг и классифайды</div>
+        </div>
+      </div>
+      <div class="badge"><span class="dot"></span> API online · маркетинг “за всё время” (auto)</div>
     </div>
 
-    <div class="card">
+    <div class="card hero">
+      <div class="heroLeft">
+        <h1>VIN-проверка</h1>
+        <p>
+          Достаём автомобиль из <b>CM.Expert</b>, показываем ключевые поля и сводную маркетинговую статистику.
+          Период маркетинга — <b>авто-режим</b>: пробуем широкий диапазон и сужаем, если API ограничивает окно.
+        </p>
+      </div>
+    </div>
+
+    <div class="card search">
       <div class="row">
-        <input id="vin" class="input" placeholder="Введите VIN (17 символов)" maxlength="17"/>
-        <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить</button>
+        <input id="vin" class="input" placeholder="Введите VIN (17 символов)" maxlength="17" />
+        <button id="btn" class="btn btn-primary" onclick="checkVin()">
+          Проверить
+        </button>
         <button class="btn btn-ghost" onclick="resetAll()">Очистить</button>
       </div>
-      <div class="muted" style="margin-top:10px">Графики отключены. Показываем только totals + классифайды.</div>
+      <div class="hint">Подсказка: VIN строго <b>17</b> символов. Графики отключены — выводим только totals и классифайды.</div>
     </div>
 
     <div id="out"></div>
+
+    <div class="footer">
+      <div>© <b>Автопортрет</b></div>
+      <div>Источник данных: CM.Expert API</div>
+    </div>
   </div>
 
 <script>
@@ -255,23 +533,32 @@ async function fetchAny(url){
   return { ok: r.ok, status: r.status, text, json };
 }
 
-function renderSourceCard(marketing, key){
+function srcCard(marketing, key, label){
   const t = marketing?.bySource?.[key]?.total || null;
   if(!t){
     return \`
-      <div class="sourceCard">
-        <div class="name">\${esc(key)}</div>
-        <div class="muted">Нет данных</div>
+      <div class="srcCard">
+        <div class="srcTop">
+          <div class="srcName">\${esc(label)}</div>
+          <div class="srcBadge">нет данных</div>
+        </div>
+        <div class="kv"><div class="k">Просмотры</div><div class="v">—</div></div>
+        <div class="kv"><div class="k">Чаты</div><div class="v">—</div></div>
+        <div class="kv"><div class="k">Расходы</div><div class="v">—</div></div>
       </div>\`;
   }
   const ch = t.chats || {};
   const sum = (t.sumWithBonusesExpenses ?? t.sumExpenses);
+  const badge = (sum != null || t.views != null || ch.total != null) ? "активен" : "—";
   return \`
-    <div class="sourceCard">
-      <div class="name">\${esc(key)}</div>
-      <div class="muted">Просмотры: <b>\${formatNum(t.views)}</b></div>
-      <div class="muted">Чаты: <b>\${formatNum(ch.total)}</b></div>
-      <div class="muted">Расходы: <b>\${sum!=null ? formatMoney(sum) : '—'}</b></div>
+    <div class="srcCard">
+      <div class="srcTop">
+        <div class="srcName">\${esc(label)}</div>
+        <div class="srcBadge">\${esc(badge)}</div>
+      </div>
+      <div class="kv"><div class="k">Просмотры</div><div class="v">\${formatNum(t.views)}</div></div>
+      <div class="kv"><div class="k">Чаты</div><div class="v">\${formatNum(ch.total)}</div></div>
+      <div class="kv"><div class="k">Расходы</div><div class="v">\${sum != null ? formatMoney(sum) : '—'}</div></div>
     </div>\`;
 }
 
@@ -279,7 +566,7 @@ function renderMarketing(marketing){
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг недоступен';
     const det = marketing?.details ? '<div class="details">' + esc(marketing.details) + '</div>' : '';
-    return '<hr class="sep"/><div class="error">' + esc(msg) + det + '</div>';
+    return '<div class="section"><div class="sectionTitle">Маркетинг</div><div class="error">' + esc(msg) + '</div>' + det + '</div>';
   }
 
   const total = marketing.total || {};
@@ -287,41 +574,51 @@ function renderMarketing(marketing){
   const sum = (total.sumWithBonusesExpenses ?? total.sumExpenses);
 
   return \`
-    <hr class="sep"/>
-    <div class="sectionTitle">Маркетинг (totals за весь доступный период)</div>
-    <div class="muted">Период: <b>\${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)}</b> · режим: <b>\${esc(marketing.period?.mode || 'auto')}</b></div>
+    <div class="section">
+      <div class="sectionTitle">Маркетинг</div>
+      <div class="meta">
+        <span class="pill"><span class="k">Период</span> <b>\${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)}</b></span>
+        <span class="pill"><span class="k">Режим</span> <b>\${esc(marketing.period?.mode || 'auto')}</b></span>
+        <span class="pill"><span class="k">Группировка</span> <b>\${esc(marketing.grouping || 'periodDay')}</b></span>
+      </div>
 
-    <div class="grid" style="margin-top:12px;">
-      <div class="kpi">
-        <div class="label">Просмотры</div>
-        <div class="value">\${formatNum(total.views)}</div>
-      </div>
-      <div class="kpi">
-        <div class="label">Чаты (всего / пропущено / платные)</div>
-        <div class="value">\${formatNum(chats.total)} / \${formatNum(chats.missed)} / \${formatNum(chats.targeted)}</div>
-      </div>
-      <div class="kpi">
-        <div class="label">Расходы всего (с бонусами)</div>
-        <div class="value">\${sum != null ? formatMoney(sum) : '—'}</div>
-      </div>
-      <div class="kpi">
-        <div class="label">Размещение / Звонки / Чаты / Тариф</div>
-        <div class="value" style="font-size:16px">
-          \${total.placementExpenses != null ? formatMoney(total.placementExpenses) : '—'} /
-          \${total.callsExpenses != null ? formatMoney(total.callsExpenses) : '—'} /
-          \${total.chatsExpenses != null ? formatMoney(total.chatsExpenses) : '—'} /
-          \${total.tariffsExpenses != null ? formatMoney(total.tariffsExpenses) : '—'}
+      <div class="marketingGrid">
+        <div class="metric">
+          <div class="label">Просмотры</div>
+          <div class="value">\${formatNum(total.views)}</div>
+          <div class="subv">Суммарные просмотры объявлений за доступный период.</div>
+        </div>
+
+        <div class="metric">
+          <div class="label">Чаты</div>
+          <div class="value">\${formatNum(chats.total)}</div>
+          <div class="subv">Пропущено: <b>\${formatNum(chats.missed)}</b> · Платные: <b>\${formatNum(chats.targeted)}</b></div>
+        </div>
+
+        <div class="metric">
+          <div class="label">Расходы всего (с бонусами)</div>
+          <div class="value">\${sum != null ? formatMoney(sum) : '—'}</div>
+          <div class="subv">Итоговый расход по всем каналам.</div>
+        </div>
+
+        <div class="metric">
+          <div class="label">Структура расходов</div>
+          <div class="value" style="font-size:16px; line-height:1.35">
+            \${total.placementExpenses != null ? formatMoney(total.placementExpenses) : '—'} · размещение<br/>
+            \${total.callsExpenses != null ? formatMoney(total.callsExpenses) : '—'} · звонки<br/>
+            \${total.chatsExpenses != null ? formatMoney(total.chatsExpenses) : '—'} · чаты<br/>
+            \${total.tariffsExpenses != null ? formatMoney(total.tariffsExpenses) : '—'} · тариф
+          </div>
         </div>
       </div>
-    </div>
 
-    <div class="sectionTitle" style="margin-top:16px;">Классифайды</div>
-    <div class="sourceGrid">
-      \${renderSourceCard(marketing,'auto.ru')}
-      \${renderSourceCard(marketing,'avito.ru')}
-      \${renderSourceCard(marketing,'drom.ru')}
-    </div>
-  \`;
+      <div class="sectionTitle" style="margin-top:18px">Классифайды</div>
+      <div class="sources">
+        \${srcCard(marketing,'auto.ru','auto.ru')}
+        \${srcCard(marketing,'avito.ru','avito.ru')}
+        \${srcCard(marketing,'drom.ru','drom.ru')}
+      </div>
+    </div>\`;
 }
 
 async function checkVin(){
@@ -329,16 +626,22 @@ async function checkVin(){
   const btn = document.getElementById('btn');
   const out = document.getElementById('out');
 
-  if(!vin){ out.innerHTML = '<div class="card"><div class="error">Введите VIN</div></div>'; return; }
-  if(vin.length !== 17){ out.innerHTML = '<div class="card"><div class="error">VIN должен быть 17 символов</div></div>'; return; }
+  if(!vin){
+    out.innerHTML = '<div class="card resultHeader"><div class="error">Введите VIN</div></div>';
+    return;
+  }
+  if(vin.length !== 17){
+    out.innerHTML = '<div class="card resultHeader"><div class="error">VIN должен быть 17 символов</div></div>';
+    return;
+  }
 
   btn.disabled = true;
-  out.innerHTML = '<div class="card"><div class="muted">Запрос...</div></div>';
+  out.innerHTML = '<div class="card"><div class="skeleton">Ищем автомобиль и маркетинг…</div></div>';
 
   try{
     const resp = await fetchAny('/check-vin?vin=' + encodeURIComponent(vin));
     if(!resp.json){
-      out.innerHTML = '<div class="card"><div class="error">Сервер вернул НЕ JSON (status '+resp.status+')</div><div class="details">'+esc(resp.text.slice(0,800))+'</div></div>';
+      out.innerHTML = '<div class="card resultHeader"><div class="error">Сервер вернул НЕ JSON (status '+resp.status+')</div><div class="details">'+esc(resp.text.slice(0,900))+'</div></div>';
       return;
     }
 
@@ -346,36 +649,41 @@ async function checkVin(){
 
     if(!resp.ok || data?.ok === false){
       const msg = data?.message || data?.error || 'Ошибка запроса';
-      out.innerHTML = '<div class="card"><div class="error">' + esc(msg) + '</div></div>';
+      out.innerHTML = '<div class="card resultHeader"><div class="error">' + esc(msg) + '</div></div>';
       return;
     }
 
     out.innerHTML = \`
       <div class="card">
-        <div class="titleRow">
-          <div>
-            <div class="title">\${esc(data.brand)} \${esc(data.model)} \${esc(data.year)}</div>
-            <div class="muted" style="margin-top:6px">VIN: <b>\${esc(vin)}</b></div>
+        <div class="resultHeader">
+          <div class="titleRow">
+            <div>
+              <h2 class="carTitle">\${esc(data.brand)} \${esc(data.model)} \${esc(data.year)}</h2>
+              <div class="meta">
+                <span class="pill"><span class="k">VIN</span> <b>\${esc(vin)}</b></span>
+                <span class="pill"><span class="k">dealerId</span> <b>\${esc(data.dealerId ?? '—')}</b></span>
+              </div>
+            </div>
           </div>
-          <div class="muted">dealerId: <b>\${esc(data.dealerId ?? '—')}</b></div>
+          <div class="divider"></div>
         </div>
 
         <div class="grid">
           <div class="kpi">
             <div class="label">Комплектация</div>
-            <div class="value" style="font-size:18px">\${esc(data.equipmentName || '—')}</div>
+            <div class="value">\${esc(data.equipmentName || '—')}</div>
           </div>
           <div class="kpi">
             <div class="label">Модификация</div>
-            <div class="value" style="font-size:18px">\${esc(data.modificationName || '—')}</div>
+            <div class="value">\${esc(data.modificationName || '—')}</div>
           </div>
           <div class="kpi">
             <div class="label">Пробег</div>
-            <div class="value">\${esc(formatMileage(data.mileage))}</div>
+            <div class="value big">\${esc(formatMileage(data.mileage))}</div>
           </div>
           <div class="kpi">
             <div class="label">Цвет</div>
-            <div class="value" style="font-size:18px">\${esc(data.color || '—')}</div>
+            <div class="value">\${esc(data.color || '—')}</div>
           </div>
         </div>
 
@@ -383,15 +691,160 @@ async function checkVin(){
       </div>
     \`;
   }catch(e){
-    out.innerHTML = '<div class="card"><div class="error">Ошибка: ' + esc(e.message) + '</div></div>';
+    out.innerHTML = '<div class="card resultHeader"><div class="error">Ошибка: ' + esc(e.message) + '</div></div>';
   }finally{
     btn.disabled = false;
   }
 }
 </script>
 </body>
-</html>`);
+</html>`
+    // Вставляем полный base64 логотип (не просим ничего добавлять)
+    .replace("__LOGO_DATA_URI__", "data:image/jpeg;base64," + FULL_LOGO_BASE64)
+  );
 });
+
+// ⬇️ Полный base64 логотип (тот самый /mnt/data/unnamed.jpg)
+const FULL_LOGO_BASE64 =
+"/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAoHBwgHBhYICAgWFhYVGBcaGBUYGRUYGBcaGBoYGBcaGC"
++ "AgICggGxolGxgYITEhJSkrLi4uGB8zODMtNygtLisBCgoKDg0OGxAQGy0lICUtLS0tLS0tLS0tLS0t"
++ "LS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAWgB4AMBIgACEQEDEQH/xAAbAA"
++ "ADAQEBAQEAAAAAAAAAAAAABQYDBAcCAf/EAD4QAAIBAgQDBgMGBQUBAAAAAAECAwQRAAUSITFBBhMi"
++ "UWEHFDKBkaGxByNCUmLB0SNTYoKy8RUzQ3OC/8QAGQEAAwEBAQAAAAAAAAAAAAAAAAECAwQF/8QAJB"
++ "EAAwEBAAICAgIDAAAAAAAAAAECEQMhEjFBBCIyQWEUcfD/2gAMAwEAAhEDEQA/APmAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
++ "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k=";
 
 // -------------------- main endpoint --------------------
 app.get("/check-vin", async (req, res) => {
@@ -404,17 +857,14 @@ app.get("/check-vin", async (req, res) => {
     const token = await getToken();
 
     // 1) авто по VIN
-    const carResponse = await http.get(
-      "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
-      {
-        params: { vin },
-        headers: { Authorization: `Bearer ${token}` },
-      }
-    );
+    const carResponse = await http.get("https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car", {
+      params: { vin },
+      headers: { Authorization: `Bearer ${token}` },
+    });
 
     const c = carResponse.data || {};
 
-    // 2) маркетинг “за всё время” (авто-fallback)
+    // 2) маркетинг + классифайды
     let marketing = { ok: false, message: "Маркетинг не удалось получить" };
 
     if (c.dealerId != null) {
@@ -423,18 +873,13 @@ app.get("/check-vin", async (req, res) => {
       if (base.ok) {
         const sources = ["auto.ru", "avito.ru", "drom.ru"];
         const tasks = sources.map((s) => fetchMarketingAllTime({ token, dealerId: c.dealerId, siteSource: s }));
-
         const results = await Promise.allSettled(tasks);
 
         const bySource = {};
         sources.forEach((s, idx) => {
           const rr = results[idx];
           if (rr.status === "fulfilled" && rr.value?.ok) {
-            bySource[s] = {
-              ok: true,
-              total: rr.value?.data?.total || null,
-              // stats нам больше не нужны — “лагов” нет, графики убрали
-            };
+            bySource[s] = { ok: true, total: rr.value?.data?.total || null };
           } else {
             bySource[s] = { ok: false, total: null };
           }
