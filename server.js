@@ -33,44 +33,8 @@ function addDays(date, days) {
   d.setDate(d.getDate() + days);
   return d;
 }
-function clamp(n, a, b) {
-  const x = Number(n);
-  if (!Number.isFinite(x)) return a;
-  return Math.max(a, Math.min(b, x));
-}
 function mkKey(parts) {
   return parts.map((x) => String(x ?? "")).join("|");
-}
-
-// ✅ inclusive periods: N days = [today-(N-1) ... today]
-function makeInclusiveRange(days, endDateObj = new Date()) {
-  const end = new Date(endDateObj);
-  const start = addDays(end, -(days - 1));
-  return { startDate: toISODate(start), endDate: toISODate(end) };
-}
-
-// ✅ split into NON-overlapping inclusive chunks of 30 days
-function makeChunks(days, endDateObj = new Date()) {
-  days = clamp(days, 1, 90);
-
-  const end = new Date(endDateObj);
-  if (days <= 30) {
-    return [makeInclusiveRange(days, end)];
-  }
-
-  // 90 = 3 chunks * 30 days (inclusive)
-  // chunk1: end = today, start = today-29
-  // chunk2: end = today-30, start = today-59
-  // chunk3: end = today-60, start = today-89
-  const chunk1End = end;
-  const chunk2End = addDays(end, -30);
-  const chunk3End = addDays(end, -60);
-
-  return [
-    makeInclusiveRange(30, chunk1End),
-    makeInclusiveRange(30, chunk2End),
-    makeInclusiveRange(30, chunk3End),
-  ];
 }
 
 // -------------------- health --------------------
@@ -85,6 +49,7 @@ async function getToken() {
 
   const clientId = process.env.CLIENT_ID;
   const clientSecret = process.env.CLIENT_SECRET;
+
   if (!clientId || !clientSecret) {
     const err = new Error("Missing CLIENT_ID or CLIENT_SECRET env vars");
     err.status = 500;
@@ -108,7 +73,7 @@ async function getToken() {
   return token;
 }
 
-// -------------------- marketing cache (TTL) --------------------
+// -------------------- marketing cache (TTL 10m) --------------------
 const marketingCache = new Map();
 function cacheGet(key) {
   const hit = marketingCache.get(key);
@@ -133,10 +98,11 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   }
 
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
+
   const body = {
     grouping: "periodDay",
-    dealerIds: [dealerIdNum],
-    siteSource, // null / 'auto.ru' / 'avito.ru' / 'drom.ru'
+    dealerIds: [dealerIdNum], // важно: число
+    siteSource, // null / auto.ru / avito.ru / drom.ru
     startDate,
     endDate,
   };
@@ -149,137 +115,6 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   });
 
   return r.data;
-}
-
-// суммирование total по кускам
-function sumTotals(a, b) {
-  const out = { ...(a || {}) };
-  out.views = Number(a?.views || 0) + Number(b?.views || 0);
-
-  const ac = a?.chats || {};
-  const bc = b?.chats || {};
-  out.chats = {
-    total: Number(ac.total || 0) + Number(bc.total || 0),
-    missed: Number(ac.missed || 0) + Number(bc.missed || 0),
-    targeted: Number(ac.targeted || 0) + Number(bc.targeted || 0),
-  };
-
-  const fields = [
-    "sumExpenses",
-    "sumWithBonusesExpenses",
-    "placementExpenses",
-    "callsExpenses",
-    "chatsExpenses",
-    "tariffsExpenses",
-  ];
-  for (const f of fields) out[f] = Number(a?.[f] || 0) + Number(b?.[f] || 0);
-
-  return out;
-}
-
-// объединение stats по дате (без двойного счёта)
-function mergeStats(statsArr) {
-  const m = new Map(); // date -> item
-  for (const it of statsArr || []) {
-    const date = it?.date;
-    if (!date) continue;
-
-    const prev = m.get(date);
-    if (!prev) {
-      m.set(date, JSON.parse(JSON.stringify(it)));
-    } else {
-      prev.views = Number(prev.views || 0) + Number(it.views || 0);
-      prev.sumExpenses = Number(prev.sumExpenses || 0) + Number(it.sumExpenses || 0);
-      prev.sumWithBonusesExpenses =
-        Number(prev.sumWithBonusesExpenses || 0) + Number(it.sumWithBonusesExpenses || 0);
-
-      const pc = prev.chats || {};
-      const ic = it.chats || {};
-      prev.chats = {
-        total: Number(pc.total || 0) + Number(ic.total || 0),
-        missed: Number(pc.missed || 0) + Number(ic.missed || 0),
-        targeted: Number(pc.targeted || 0) + Number(ic.targeted || 0),
-      };
-    }
-  }
-  return Array.from(m.values()).sort((x, y) => String(x.date).localeCompare(String(y.date)));
-}
-
-// сборка маркетинга
-async function getMarketingBundle({ token, dealerId, days }) {
-  days = clamp(days || 30, 1, 90);
-  const chunks = makeChunks(days, new Date());
-  const sources = ["auto.ru", "avito.ru", "drom.ru"];
-
-  let total = null;
-  let statsAll = [];
-
-  const bySourceTotals = { "auto.ru": null, "avito.ru": null, "drom.ru": null };
-  const bySourceStats = { "auto.ru": [], "avito.ru": [], "drom.ru": [] };
-
-  let anySuccess = false;
-  let lastError = null;
-
-  for (const ch of chunks) {
-    const tasks = [
-      fetchMarketing({ token, dealerId, ...ch, siteSource: null }),
-      ...sources.map((s) => fetchMarketing({ token, dealerId, ...ch, siteSource: s })),
-    ];
-
-    const results = await Promise.allSettled(tasks);
-
-    if (results[0].status === "fulfilled") {
-      anySuccess = true;
-      const base = results[0].value;
-      total = sumTotals(total, base?.total || {});
-      if (Array.isArray(base?.stats)) statsAll.push(...base.stats);
-    } else {
-      lastError = results[0].reason;
-    }
-
-    sources.forEach((s, idx) => {
-      const rr = results[idx + 1];
-      if (rr.status === "fulfilled") {
-        anySuccess = true;
-        const v = rr.value;
-        bySourceTotals[s] = sumTotals(bySourceTotals[s], v?.total || {});
-        if (Array.isArray(v?.stats)) bySourceStats[s].push(...v.stats);
-      } else {
-        lastError = rr.reason;
-      }
-    });
-  }
-
-  if (!anySuccess) {
-    const status = lastError?.response?.status || lastError?.status || 500;
-    const msg =
-      lastError?.response?.data?.message ||
-      lastError?.response?.data?.error ||
-      lastError?.message ||
-      "Marketing API failed";
-    return { ok: false, status, message: msg };
-  }
-
-  const period = makeInclusiveRange(days, new Date());
-  period.days = days;
-
-  const bySource = {};
-  for (const s of sources) {
-    bySource[s] = {
-      ok: true,
-      total: bySourceTotals[s],
-      stats: mergeStats(bySourceStats[s]),
-    };
-  }
-
-  return {
-    ok: true,
-    grouping: "periodDay",
-    period,
-    total,
-    stats: mergeStats(statsAll),
-    bySource,
-  };
 }
 
 // -------------------- UI --------------------
@@ -316,34 +151,19 @@ body{
   margin:40px auto;
   padding:0 16px;
 }
-.header{
-  display:flex;
-  align-items:flex-end;
-  justify-content:space-between;
-  gap:16px;
-  margin-bottom:18px;
-}
-h1{
-  font-size:38px;
-  margin:0;
-  letter-spacing:-.02em;
-}
-.sub{
-  margin:6px 0 0;
-  color:var(--muted);
-  font-size:14px;
-}
+h1{font-size:38px; margin:0; letter-spacing:-.02em}
+.sub{margin:8px 0 0; color:var(--muted); font-size:14px}
 .card{
   background:var(--card);
   border:1px solid rgba(229,231,235,.8);
   border-radius:18px;
   padding:18px;
   box-shadow:0 14px 40px rgba(15,23,42,.06);
+  margin-top:16px;
 }
 .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center}
 .input{
-  flex:1;
-  min-width:260px;
+  flex:1; min-width:260px;
   padding:14px 14px;
   border-radius:12px;
   border:1px solid var(--border);
@@ -355,39 +175,15 @@ h1{
   padding:12px 14px;
   border-radius:12px;
   border:none;
-  font-weight:700;
+  font-weight:800;
   cursor:pointer;
 }
 .btn-primary{background:var(--accent); color:#fff}
 .btn-ghost{background:#f3f4f6; color:#111827}
 .btn:disabled{opacity:.6; cursor:not-allowed}
 
-.pills{display:flex; gap:8px; flex-wrap:wrap}
-.pill{
-  padding:9px 12px;
-  border-radius:999px;
-  border:1px solid var(--border);
-  background:#fff;
-  cursor:pointer;
-  font-weight:700;
-  font-size:14px;
-}
-.pill.active{
-  border-color:transparent;
-  background:#111827;
-  color:#fff;
-}
-
-.sectionTitle{
-  margin:18px 0 10px;
-  font-size:18px;
-  letter-spacing:-.01em;
-}
-.grid{
-  display:grid;
-  grid-template-columns:repeat(12,1fr);
-  gap:12px;
-}
+.sectionTitle{margin:18px 0 10px; font-size:18px; letter-spacing:-.01em}
+.grid{display:grid; grid-template-columns:repeat(12,1fr); gap:12px;}
 .kpi{
   grid-column:span 3;
   background:linear-gradient(180deg,#ffffff 0%, #fafafa 100%);
@@ -397,7 +193,6 @@ h1{
 }
 .kpi .label{color:var(--muted); font-size:12px; margin-bottom:6px}
 .kpi .value{font-size:22px; font-weight:900}
-
 @media(max-width:900px){ .kpi{grid-column:span 6} }
 @media(max-width:560px){ .kpi{grid-column:span 12} h1{font-size:30px} }
 
@@ -423,11 +218,7 @@ h1{
   border-radius:14px;
 }
 
-.sourceGrid{
-  display:grid;
-  grid-template-columns:repeat(12,1fr);
-  gap:12px;
-}
+.sourceGrid{display:grid; grid-template-columns:repeat(12,1fr); gap:12px;}
 .sourceCard{
   grid-column:span 4;
   border:1px solid rgba(229,231,235,.9);
@@ -438,21 +229,14 @@ h1{
 @media(max-width:900px){ .sourceCard{grid-column:span 6} }
 @media(max-width:560px){ .sourceCard{grid-column:span 12} }
 
-hr.sep{
-  border:0;
-  height:1px;
-  background:rgba(229,231,235,.9);
-  margin:16px 0;
-}
+hr.sep{border:0; height:1px; background:rgba(229,231,235,.9); margin:16px 0;}
 </style>
 </head>
 <body>
 <div class="container">
-  <div class="header">
-    <div>
-      <h1>Проверка автомобиля по VIN</h1>
-      <div class="sub">VIN → авто · dealerId → маркетинг · фильтр 7/30/90 · графики</div>
-    </div>
+  <div>
+    <h1>Проверка автомобиля по VIN</h1>
+    <div class="sub">Маркетинг показывается за последние <b>30 дней</b> (как в прежней рабочей версии) + графики.</div>
   </div>
 
   <div class="card">
@@ -461,22 +245,14 @@ hr.sep{
       <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить</button>
       <button class="btn btn-ghost" onclick="resetAll()">Очистить</button>
     </div>
-
-    <div style="margin-top:12px" class="row">
-      <div class="muted">Период маркетинга:</div>
-      <div class="pills">
-        <button class="pill" data-days="7" onclick="setDays(7)">7 дней</button>
-        <button class="pill active" data-days="30" onclick="setDays(30)">30 дней</button>
-        <button class="pill" data-days="90" onclick="setDays(90)">90 дней</button>
-      </div>
-    </div>
+    <div class="muted" style="margin-top:10px">Период маркетинга фиксированный: последние 30 дней.</div>
   </div>
 
-  <div id="out" style="margin-top:14px"></div>
+  <div id="out"></div>
 </div>
 
 <script>
-let current = { dealerId: null, days: 30 };
+let current = { dealerId: null };
 let chartMain = null;
 let chartSources = null;
 
@@ -497,14 +273,6 @@ function fmtMileage(x){
   const n = Number(x);
   if(!Number.isFinite(n)) return '—';
   return n.toLocaleString('ru-RU') + ' км';
-}
-
-function setDays(days){
-  current.days = Number(days);
-  document.querySelectorAll(".pill").forEach(b => {
-    b.classList.toggle("active", Number(b.dataset.days) === Number(days));
-  });
-  if(current.dealerId) loadMarketing();
 }
 
 function resetAll(){
@@ -700,10 +468,10 @@ async function loadMarketing(){
   const holder = document.getElementById("marketingBlock");
   if(!holder) return;
 
-  holder.innerHTML = '<div class="muted">Загружаем маркетинг за ' + esc(current.days) + ' дней…</div>';
+  holder.innerHTML = '<div class="muted">Загружаем маркетинг за последние 30 дней…</div>';
 
   try{
-    const r = await fetch('/marketing?dealerId=' + encodeURIComponent(current.dealerId) + '&days=' + encodeURIComponent(current.days));
+    const r = await fetch('/marketing?dealerId=' + encodeURIComponent(current.dealerId));
     const data = await r.json();
 
     if(!r.ok || !data?.ok){
@@ -758,11 +526,9 @@ app.get("/check-vin", async (req, res) => {
   }
 });
 
-// -------------------- /marketing --------------------
+// -------------------- /marketing (FIXED 30 days only) --------------------
 app.get("/marketing", async (req, res) => {
   const dealerIdRaw = String(req.query.dealerId || "").trim();
-  const days = clamp(req.query.days || 30, 1, 90);
-
   if (!dealerIdRaw) return res.status(400).json({ ok: false, message: "dealerId is required" });
 
   const dealerId = Number(dealerIdRaw);
@@ -770,40 +536,65 @@ app.get("/marketing", async (req, res) => {
     return res.status(400).json({ ok: false, message: "dealerId must be a number" });
   }
 
-  const key = mkKey(["mkt", dealerId, days]);
-  const cached = cacheGet(key);
+  // ✅ строго 30 дней одним куском (как в прежней версии)
+  const endDate = toISODate(new Date());
+  const startDate = toISODate(addDays(new Date(), -30));
+
+  const cacheKey = mkKey(["mkt30", dealerId, startDate, endDate]);
+  const cached = cacheGet(cacheKey);
   if (cached) return res.json({ ok: true, cached: true, marketing: cached });
 
   try {
     const token = await getToken();
-    const marketing = await getMarketingBundle({ token, dealerId, days });
 
-    // кэш: ok=10 минут; ошибка=1 минута
-    cacheSet(key, marketing, marketing.ok ? 10 * 60 * 1000 : 60 * 1000);
+    const sources = ["auto.ru", "avito.ru", "drom.ru"];
+    const tasks = [
+      fetchMarketing({ token, dealerId, startDate, endDate, siteSource: null }),
+      ...sources.map((s) => fetchMarketing({ token, dealerId, startDate, endDate, siteSource: s })),
+    ];
 
-    if (!marketing.ok) {
-      return res.status(502).json({ ok: false, message: marketing.message, status: marketing.status });
+    const results = await Promise.allSettled(tasks);
+
+    const base = results[0].status === "fulfilled" ? results[0].value : null;
+
+    if (!base) {
+      const err = results[0].reason;
+      const status = err?.response?.status || 500;
+      const msg = err?.response?.data?.message || err?.message || "Marketing request failed";
+      return res.status(502).json({ ok: false, message: msg, status });
     }
 
+    const bySource = {};
+    sources.forEach((s, idx) => {
+      const rr = results[idx + 1];
+      if (rr.status === "fulfilled") {
+        bySource[s] = { ok: true, total: rr.value?.total || null, stats: rr.value?.stats || null };
+      } else {
+        bySource[s] = { ok: false, total: null, stats: null };
+      }
+    });
+
+    const marketing = {
+      ok: true,
+      grouping: "periodDay",
+      period: { startDate, endDate, days: 30 },
+      total: base.total || null,
+      stats: base.stats || null,
+      bySource,
+    };
+
+    cacheSet(cacheKey, marketing, 10 * 60 * 1000);
     return res.json({ ok: true, cached: false, marketing });
   } catch (e) {
     const status = e?.response?.status || 500;
-    const msg =
-      e?.response?.data?.message ||
-      e?.response?.data?.error ||
-      e?.message ||
-      "Marketing request failed";
+    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "Marketing request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
 
 // -------------------- hardening --------------------
-process.on("unhandledRejection", (reason) => {
-  console.error("[unhandledRejection]", reason);
-});
-process.on("uncaughtException", (err) => {
-  console.error("[uncaughtException]", err);
-});
+process.on("unhandledRejection", (reason) => console.error("[unhandledRejection]", reason));
+process.on("uncaughtException", (err) => console.error("[uncaughtException]", err));
 
 // -------------------- start --------------------
 app.listen(PORT, "0.0.0.0", () => {
