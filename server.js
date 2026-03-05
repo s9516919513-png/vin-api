@@ -36,6 +36,47 @@ function addDays(date, days) {
 function mkKey(parts) {
   return parts.map((x) => String(x ?? "")).join("|");
 }
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+function clampInt(v, a, b) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return a;
+  return Math.max(a, Math.min(b, Math.trunc(n)));
+}
+
+// безопасно достаём вложенные значения по пути "a.b.c"
+function getPath(obj, path) {
+  if (!obj) return undefined;
+  const parts = String(path).split(".");
+  let cur = obj;
+  for (const p of parts) {
+    if (cur && Object.prototype.hasOwnProperty.call(cur, p)) cur = cur[p];
+    else return undefined;
+  }
+  return cur;
+}
+
+// ищем первое числовое значение среди вариантов путей
+function pickNumber(obj, paths, fallback = 0) {
+  for (const p of paths) {
+    const v = getPath(obj, p);
+    const n = num(v);
+    if (n !== null) return n;
+  }
+  return fallback;
+}
+
+// ищем дату для точки графика
+function pickDate(item) {
+  const candidates = ["date", "day", "period", "periodDay", "dt", "dateFrom", "dateTo"];
+  for (const k of candidates) {
+    const v = item?.[k];
+    if (typeof v === "string" && v.length >= 8) return v.slice(0, 10);
+  }
+  return null;
+}
 
 // -------------------- health --------------------
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
@@ -88,8 +129,8 @@ function cacheSet(key, value, ttlMs) {
   marketingCache.set(key, { value, expiresAt: Date.now() + ttlMs });
 }
 
-// -------------------- marketing API --------------------
-async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
+// -------------------- CM marketing fetch --------------------
+async function fetchMarketingRaw({ token, dealerId, startDate, endDate, siteSource = null }) {
   const dealerIdNum = Number(dealerId);
   if (!Number.isFinite(dealerIdNum)) {
     const err = new Error("Invalid dealerId (must be a number)");
@@ -98,11 +139,10 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   }
 
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
-
   const body = {
     grouping: "periodDay",
-    dealerIds: [dealerIdNum], // важно: число
-    siteSource, // null / auto.ru / avito.ru / drom.ru
+    dealerIds: [dealerIdNum],
+    siteSource,
     startDate,
     endDate,
   };
@@ -117,6 +157,118 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
   return r.data;
 }
 
+// -------------------- normalize CM marketing response --------------------
+// делаем “устойчивый” парсер: если у CM.Expert поля названы иначе — всё равно соберём цифры.
+function normalizeMarketing(raw) {
+  // некоторые API кладут данные в raw.data — учтём
+  const root = raw?.data && (raw.total || raw.stats) == null ? raw.data : raw;
+
+  const totalSrc = root?.total ?? root ?? {};
+
+  // просмотры
+  const views = pickNumber(totalSrc, [
+    "views",
+    "viewsCount",
+    "viewCount",
+    "impressions",
+    "impressionsCount",
+    "shows",
+    "showsCount",
+  ], 0);
+
+  // звонки (часто именно они “есть”, а чаты нет)
+  const callsTotal = pickNumber(totalSrc, [
+    "calls.total",
+    "callsTotal",
+    "call.total",
+    "callTotal",
+    "callsCount",
+    "callCount",
+    "phoneCalls",
+    "phoneCallsCount",
+  ], 0);
+
+  const callsMissed = pickNumber(totalSrc, [
+    "calls.missed",
+    "callsMissed",
+    "call.missed",
+    "callMissed",
+    "missedCalls",
+    "missedCallsCount",
+  ], 0);
+
+  // чаты
+  const chatsTotal = pickNumber(totalSrc, [
+    "chats.total",
+    "chatsTotal",
+    "chat.total",
+    "chatTotal",
+    "chatsCount",
+    "chatCount",
+  ], 0);
+
+  const chatsMissed = pickNumber(totalSrc, [
+    "chats.missed",
+    "chatsMissed",
+    "chat.missed",
+    "chatMissed",
+  ], 0);
+
+  const chatsPaid = pickNumber(totalSrc, [
+    "chats.targeted",
+    "chats.paid",
+    "chatsPaid",
+    "paidChats",
+    "targetedChats",
+  ], 0);
+
+  // расходы
+  const sumExpenses = pickNumber(totalSrc, ["sumExpenses", "expenses", "totalExpenses"], 0);
+  const sumWithBonusesExpenses = pickNumber(totalSrc, ["sumWithBonusesExpenses", "expensesWithBonuses"], sumExpenses);
+
+  const placementExpenses = pickNumber(totalSrc, ["placementExpenses", "placementsExpenses"], 0);
+  const callsExpenses = pickNumber(totalSrc, ["callsExpenses", "callExpenses", "phoneCallsExpenses"], 0);
+  const chatsExpenses = pickNumber(totalSrc, ["chatsExpenses", "chatExpenses"], 0);
+  const tariffsExpenses = pickNumber(totalSrc, ["tariffsExpenses", "tariffExpenses"], 0);
+
+  // stats (по дням)
+  const statsSrc = Array.isArray(root?.stats) ? root.stats : Array.isArray(root?.items) ? root.items : [];
+  const stats = statsSrc
+    .map((it) => {
+      const date = pickDate(it);
+      if (!date) return null;
+
+      const vViews = pickNumber(it, ["views", "viewsCount", "impressions", "shows"], 0);
+      const vCalls = pickNumber(it, ["calls.total", "callsTotal", "callsCount", "phoneCalls"], 0);
+      const vChats = pickNumber(it, ["chats.total", "chatsTotal", "chatsCount"], 0);
+
+      return {
+        date,
+        views: vViews,
+        calls: { total: vCalls },
+        chats: { total: vChats },
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  return {
+    ok: true,
+    total: {
+      views,
+      calls: { total: callsTotal, missed: callsMissed },
+      chats: { total: chatsTotal, missed: chatsMissed, paid: chatsPaid },
+      sumExpenses,
+      sumWithBonusesExpenses,
+      placementExpenses,
+      callsExpenses,
+      chatsExpenses,
+      tariffsExpenses,
+    },
+    stats,
+  };
+}
+
 // -------------------- UI --------------------
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
@@ -125,7 +277,6 @@ app.get("/", (req, res) => {
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1"/>
 <title>VIN аналитика</title>
-
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 
 <style>
@@ -146,13 +297,9 @@ body{
               var(--bg);
   color:var(--text);
 }
-.container{
-  max-width:1100px;
-  margin:40px auto;
-  padding:0 16px;
-}
-h1{font-size:38px; margin:0; letter-spacing:-.02em}
-.sub{margin:8px 0 0; color:var(--muted); font-size:14px}
+.container{max-width:1100px;margin:40px auto;padding:0 16px;}
+h1{font-size:38px;margin:0;letter-spacing:-.02em}
+.sub{margin:8px 0 0;color:var(--muted);font-size:14px}
 .card{
   background:var(--card);
   border:1px solid rgba(229,231,235,.8);
@@ -161,29 +308,19 @@ h1{font-size:38px; margin:0; letter-spacing:-.02em}
   box-shadow:0 14px 40px rgba(15,23,42,.06);
   margin-top:16px;
 }
-.row{display:flex; gap:12px; flex-wrap:wrap; align-items:center}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
 .input{
-  flex:1; min-width:260px;
-  padding:14px 14px;
-  border-radius:12px;
-  border:1px solid var(--border);
-  outline:none;
-  font-size:16px;
-  background:#fff;
+  flex:1;min-width:260px;
+  padding:14px 14px;border-radius:12px;border:1px solid var(--border);
+  outline:none;font-size:16px;background:#fff;
 }
-.btn{
-  padding:12px 14px;
-  border-radius:12px;
-  border:none;
-  font-weight:800;
-  cursor:pointer;
-}
-.btn-primary{background:var(--accent); color:#fff}
-.btn-ghost{background:#f3f4f6; color:#111827}
-.btn:disabled{opacity:.6; cursor:not-allowed}
+.btn{padding:12px 14px;border-radius:12px;border:none;font-weight:800;cursor:pointer;}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-ghost{background:#f3f4f6;color:#111827}
+.btn:disabled{opacity:.6;cursor:not-allowed}
 
-.sectionTitle{margin:18px 0 10px; font-size:18px; letter-spacing:-.01em}
-.grid{display:grid; grid-template-columns:repeat(12,1fr); gap:12px;}
+.sectionTitle{margin:18px 0 10px;font-size:18px;letter-spacing:-.01em}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;}
 .kpi{
   grid-column:span 3;
   background:linear-gradient(180deg,#ffffff 0%, #fafafa 100%);
@@ -191,52 +328,28 @@ h1{font-size:38px; margin:0; letter-spacing:-.02em}
   border-radius:16px;
   padding:14px;
 }
-.kpi .label{color:var(--muted); font-size:12px; margin-bottom:6px}
-.kpi .value{font-size:22px; font-weight:900}
-@media(max-width:900px){ .kpi{grid-column:span 6} }
-@media(max-width:560px){ .kpi{grid-column:span 12} h1{font-size:30px} }
+.kpi .label{color:var(--muted);font-size:12px;margin-bottom:6px}
+.kpi .value{font-size:22px;font-weight:900}
+@media(max-width:900px){.kpi{grid-column:span 6}}
+@media(max-width:560px){.kpi{grid-column:span 12}h1{font-size:30px}}
 
-.split{
-  display:grid;
-  grid-template-columns:1.4fr 1fr;
-  gap:12px;
-}
-@media(max-width:900px){ .split{grid-template-columns:1fr} }
-
-.panel{
-  border:1px solid rgba(229,231,235,.9);
-  border-radius:16px;
-  padding:14px;
-  background:#fff;
-}
-.muted{color:var(--muted); font-size:14px}
-.error{
-  background:#fff1f2;
-  border:1px solid #fecdd3;
-  color:#9f1239;
-  padding:12px 14px;
-  border-radius:14px;
-}
-
-.sourceGrid{display:grid; grid-template-columns:repeat(12,1fr); gap:12px;}
-.sourceCard{
-  grid-column:span 4;
-  border:1px solid rgba(229,231,235,.9);
-  border-radius:16px;
-  padding:14px;
-  background:#fff;
-}
-@media(max-width:900px){ .sourceCard{grid-column:span 6} }
-@media(max-width:560px){ .sourceCard{grid-column:span 12} }
-
-hr.sep{border:0; height:1px; background:rgba(229,231,235,.9); margin:16px 0;}
+.split{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;}
+@media(max-width:900px){.split{grid-template-columns:1fr}}
+.panel{border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
+.muted{color:var(--muted);font-size:14px}
+.error{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;padding:12px 14px;border-radius:14px;}
+.sourceGrid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;}
+.sourceCard{grid-column:span 4;border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
+@media(max-width:900px){.sourceCard{grid-column:span 6}}
+@media(max-width:560px){.sourceCard{grid-column:span 12}}
+hr.sep{border:0;height:1px;background:rgba(229,231,235,.9);margin:16px 0;}
 </style>
 </head>
 <body>
 <div class="container">
   <div>
     <h1>Проверка автомобиля по VIN</h1>
-    <div class="sub">Маркетинг показывается за последние <b>30 дней</b> (как в прежней рабочей версии) + графики.</div>
+    <div class="sub">Маркетинг — последние <b>30 дней</b>. Показываем <b>звонки</b>, <b>чаты</b> и <b>лиды</b>.</div>
   </div>
 
   <div class="card">
@@ -324,17 +437,23 @@ function renderMarketing(m){
   }
 
   const t = m.total || {};
+  const calls = t.calls || {};
   const chats = t.chats || {};
+  const leads = (Number(calls.total||0) + Number(chats.total||0));
   const period = m.period || {};
 
   const src = (key, title) => {
     const x = m.bySource?.[key]?.total;
-    const ch = x?.chats || {};
+    const xc = x?.calls || {};
+    const xh = x?.chats || {};
+    const xLeads = (Number(xc.total||0) + Number(xh.total||0));
     return \`
       <div class="sourceCard">
         <div style="font-weight:900; font-size:16px">\${esc(title)}</div>
         <div class="muted" style="margin-top:8px">Просмотры: <b>\${fmtNum(x?.views)}</b></div>
-        <div class="muted">Чаты: <b>\${fmtNum(ch?.total)}</b></div>
+        <div class="muted">Звонки: <b>\${fmtNum(xc?.total)}</b></div>
+        <div class="muted">Чаты: <b>\${fmtNum(xh?.total)}</b></div>
+        <div class="muted">Лиды: <b>\${fmtNum(xLeads)}</b></div>
         <div class="muted">Расходы: <b>\${fmtMoney(x?.sumWithBonusesExpenses ?? x?.sumExpenses)}</b></div>
       </div>\`;
   };
@@ -349,14 +468,23 @@ function renderMarketing(m){
         <div class="value">\${fmtNum(t.views)}</div>
       </div>
       <div class="kpi">
-        <div class="label">Чаты (всего / пропущено / платные)</div>
-        <div class="value" style="font-size:18px">\${fmtNum(chats.total)} / \${fmtNum(chats.missed)} / \${fmtNum(chats.targeted)}</div>
+        <div class="label">Звонки (всего / пропущено)</div>
+        <div class="value" style="font-size:18px">\${fmtNum(calls.total)} / \${fmtNum(calls.missed)}</div>
       </div>
+      <div class="kpi">
+        <div class="label">Чаты (всего / пропущено / платные)</div>
+        <div class="value" style="font-size:18px">\${fmtNum(chats.total)} / \${fmtNum(chats.missed)} / \${fmtNum(chats.paid)}</div>
+      </div>
+      <div class="kpi">
+        <div class="label">Лиды (звонки + чаты)</div>
+        <div class="value">\${fmtNum(leads)}</div>
+      </div>
+
       <div class="kpi">
         <div class="label">Расходы всего (с бонусами)</div>
         <div class="value">\${fmtMoney(t.sumWithBonusesExpenses ?? t.sumExpenses)}</div>
       </div>
-      <div class="kpi">
+      <div class="kpi" style="grid-column:span 6">
         <div class="label">Размещение / Звонки / Чаты / Тариф</div>
         <div class="value" style="font-size:16px">
           \${fmtMoney(t.placementExpenses)} / \${fmtMoney(t.callsExpenses)} / \${fmtMoney(t.chatsExpenses)} / \${fmtMoney(t.tariffsExpenses)}
@@ -366,11 +494,11 @@ function renderMarketing(m){
 
     <div class="split" style="margin-top:14px">
       <div class="panel">
-        <div style="font-weight:900; margin-bottom:10px">Динамика: просмотры и чаты</div>
+        <div style="font-weight:900; margin-bottom:10px">Динамика: просмотры / звонки / чаты</div>
         <canvas id="chartMain" height="120"></canvas>
       </div>
       <div class="panel">
-        <div style="font-weight:900; margin-bottom:10px">Чаты по источникам</div>
+        <div style="font-weight:900; margin-bottom:10px">Лиды по источникам</div>
         <canvas id="chartSources" height="120"></canvas>
       </div>
     </div>
@@ -390,6 +518,7 @@ function drawCharts(m){
   const stats = Array.isArray(m.stats) ? m.stats : [];
   const labels = stats.map(x => x.date);
   const views = stats.map(x => Number(x.views||0));
+  const calls = stats.map(x => Number(x.calls?.total||0));
   const chats = stats.map(x => Number(x.chats?.total||0));
 
   const ctx1 = document.getElementById("chartMain").getContext("2d");
@@ -400,7 +529,8 @@ function drawCharts(m){
       labels,
       datasets: [
         { label: "Просмотры", data: views, tension: 0.25 },
-        { label: "Чаты", data: chats, tension: 0.25 }
+        { label: "Звонки", data: calls, tension: 0.25 },
+        { label: "Чаты", data: chats, tension: 0.25 },
       ]
     },
     options: {
@@ -412,7 +542,12 @@ function drawCharts(m){
 
   const srcKeys = ["auto.ru","avito.ru","drom.ru"];
   const srcLabels = ["auto.ru","avito.ru","drom.ru"];
-  const srcChats = srcKeys.map(k => Number(m.bySource?.[k]?.total?.chats?.total || 0));
+  const leads = srcKeys.map(k => {
+    const t = m.bySource?.[k]?.total || {};
+    const c = t.calls?.total || 0;
+    const h = t.chats?.total || 0;
+    return Number(c) + Number(h);
+  });
 
   const ctx2 = document.getElementById("chartSources").getContext("2d");
   if(chartSources) chartSources.destroy();
@@ -420,7 +555,7 @@ function drawCharts(m){
     type: "bar",
     data: {
       labels: srcLabels,
-      datasets: [{ label: "Чаты", data: srcChats }]
+      datasets: [{ label: "Лиды (звонки+чаты)", data: leads }]
     },
     options: {
       responsive: true,
@@ -497,7 +632,6 @@ app.get("/check-vin", async (req, res) => {
 
   try {
     const token = await getToken();
-
     const r = await http.get("https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car", {
       params: { vin },
       headers: { Authorization: `Bearer ${token}` },
@@ -516,17 +650,13 @@ app.get("/check-vin", async (req, res) => {
       dealerId: c.dealerId ?? null,
     });
   } catch (e) {
-    const status = e?.status || e?.response?.status || 500;
-    const msg =
-      e?.response?.data?.message ||
-      e?.response?.data?.error ||
-      e?.message ||
-      "VIN request failed";
+    const status = e?.response?.status || 500;
+    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "VIN request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
 
-// -------------------- /marketing (FIXED 30 days only) --------------------
+// -------------------- /marketing (last 30 days, robust parsing) --------------------
 app.get("/marketing", async (req, res) => {
   const dealerIdRaw = String(req.query.dealerId || "").trim();
   if (!dealerIdRaw) return res.status(400).json({ ok: false, message: "dealerId is required" });
@@ -536,11 +666,10 @@ app.get("/marketing", async (req, res) => {
     return res.status(400).json({ ok: false, message: "dealerId must be a number" });
   }
 
-  // ✅ строго 30 дней одним куском (как в прежней версии)
   const endDate = toISODate(new Date());
   const startDate = toISODate(addDays(new Date(), -30));
 
-  const cacheKey = mkKey(["mkt30", dealerId, startDate, endDate]);
+  const cacheKey = mkKey(["mkt30_norm", dealerId, startDate, endDate]);
   const cached = cacheGet(cacheKey);
   if (cached) return res.json({ ok: true, cached: true, marketing: cached });
 
@@ -549,28 +678,29 @@ app.get("/marketing", async (req, res) => {
 
     const sources = ["auto.ru", "avito.ru", "drom.ru"];
     const tasks = [
-      fetchMarketing({ token, dealerId, startDate, endDate, siteSource: null }),
-      ...sources.map((s) => fetchMarketing({ token, dealerId, startDate, endDate, siteSource: s })),
+      fetchMarketingRaw({ token, dealerId, startDate, endDate, siteSource: null }),
+      ...sources.map((s) => fetchMarketingRaw({ token, dealerId, startDate, endDate, siteSource: s })),
     ];
 
     const results = await Promise.allSettled(tasks);
 
-    const base = results[0].status === "fulfilled" ? results[0].value : null;
-
-    if (!base) {
+    const baseRaw = results[0].status === "fulfilled" ? results[0].value : null;
+    if (!baseRaw) {
       const err = results[0].reason;
       const status = err?.response?.status || 500;
       const msg = err?.response?.data?.message || err?.message || "Marketing request failed";
       return res.status(502).json({ ok: false, message: msg, status });
     }
 
+    const base = normalizeMarketing(baseRaw);
+
     const bySource = {};
     sources.forEach((s, idx) => {
       const rr = results[idx + 1];
       if (rr.status === "fulfilled") {
-        bySource[s] = { ok: true, total: rr.value?.total || null, stats: rr.value?.stats || null };
+        bySource[s] = normalizeMarketing(rr.value);
       } else {
-        bySource[s] = { ok: false, total: null, stats: null };
+        bySource[s] = { ok: false, message: "source failed" };
       }
     });
 
@@ -578,8 +708,8 @@ app.get("/marketing", async (req, res) => {
       ok: true,
       grouping: "periodDay",
       period: { startDate, endDate, days: 30 },
-      total: base.total || null,
-      stats: base.stats || null,
+      total: base.total,
+      stats: base.stats,
       bySource,
     };
 
