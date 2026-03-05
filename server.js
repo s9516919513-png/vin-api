@@ -28,23 +28,21 @@ function addDays(date, days) {
   d.setDate(d.getDate() + days);
   return d;
 }
-function isPlainObject(v) {
-  return v && typeof v === "object" && !Array.isArray(v);
-}
 function safeNum(v) {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
 }
-function pickFirstIdLike(obj, preferredKeys) {
-  // 1) прямые ключи
-  for (const k of preferredKeys) {
-    if (obj && Object.prototype.hasOwnProperty.call(obj, k)) {
-      const n = safeNum(obj[k]);
-      if (n != null) return { key: k, value: n, path: k };
+function pickStockCardId(carObj) {
+  // 1) прямые поля (самые вероятные)
+  const directKeys = ["stockCardId", "stock_card_id", "stockCardID", "stockcardid"];
+  for (const k of directKeys) {
+    if (carObj && Object.prototype.hasOwnProperty.call(carObj, k)) {
+      const n = safeNum(carObj[k]);
+      if (n != null) return { value: n, path: k };
     }
   }
 
-  // 2) рекурсивный поиск: ищем числовые id по приоритетным именам
+  // 2) рекурсивный поиск (на случай вложенных структур)
   const seen = new Set();
   function walk(node, path) {
     if (!node || typeof node !== "object") return null;
@@ -59,43 +57,50 @@ function pickFirstIdLike(obj, preferredKeys) {
       return null;
     }
 
-    // сначала приоритетные ключи на этом уровне
-    for (const k of preferredKeys) {
+    for (const k of directKeys) {
       if (Object.prototype.hasOwnProperty.call(node, k)) {
         const n = safeNum(node[k]);
-        if (n != null) return { key: k, value: n, path: `${path}.${k}`.replace(/^\./, "") };
+        if (n != null) return { value: n, path: `${path}.${k}`.replace(/^\./, "") };
       }
     }
 
-    // затем общий обход
     for (const [k, v] of Object.entries(node)) {
       const r = walk(v, `${path}.${k}`.replace(/^\./, ""));
       if (r) return r;
     }
-
     return null;
   }
 
-  return walk(obj, "");
+  return walk(carObj, "");
 }
+function normalizeStatsEntry(entry) {
+  if (!entry || typeof entry !== "object") return null;
 
-function isEmptyTotal(total) {
-  // тотал может быть null или со всеми нулями
-  if (!total || typeof total !== "object") return true;
+  // Вариант 1: entry.total содержит поля
+  if (entry.total && typeof entry.total === "object") return entry.total;
 
-  const views = safeNum(total.views) ?? 0;
-  const chatsTotal = safeNum(total?.chats?.total) ?? 0;
-
-  const sum =
-    safeNum(total.sumWithBonusesExpenses) ??
-    safeNum(total.sumExpenses) ??
-    safeNum(total.placementExpenses) ??
-    safeNum(total.callsExpenses) ??
-    safeNum(total.chatsExpenses) ??
-    safeNum(total.tariffsExpenses) ??
-    0;
-
-  return views === 0 && chatsTotal === 0 && sum === 0;
+  // Вариант 2: поля лежат прямо в entry (на разных версиях swagger так бывает)
+  const maybe = {};
+  const keys = [
+    "views",
+    "promotionExpenses",
+    "promotionBonusesExpenses",
+    "placementExpenses",
+    "callsExpenses",
+    "chatsExpenses",
+    "tariffsExpenses",
+    "sumExpenses",
+    "sumWithBonusesExpenses",
+    "chats",
+  ];
+  let found = false;
+  for (const k of keys) {
+    if (Object.prototype.hasOwnProperty.call(entry, k)) {
+      maybe[k] = entry[k];
+      found = true;
+    }
+  }
+  return found ? maybe : null;
 }
 
 // -------------------- token cache --------------------
@@ -121,126 +126,64 @@ async function getToken() {
   return token;
 }
 
-// -------------------- marketing API --------------------
-async function postMarketing({ token, body }) {
+// -------------------- marketing API (по доке) --------------------
+async function fetchMarketingStockCars({ token, dealerId, siteSource, startDate, endDate }) {
+  // По твоему Swagger:
+  // grouping: enum включает "stockCardId" и "periodDay"
+  // dealerIds: Array[integer] (min 1)
+  // siteSource: null | "auto.ru" | "avito.ru" | "drom.ru"
+  // startDate/endDate: YYYY-MM-DD, startDate минимум -31 день от endDate
+
   const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
+
+  const body = {
+    grouping: "stockCardId",
+    dealerIds: [Number(dealerId)],
+    siteSource: siteSource ?? null,
+    startDate,
+    endDate,
+  };
+
   const r = await http.post(url, body, {
     headers: {
       Authorization: `Bearer ${token}`,
       "Content-Type": "application/json",
       Accept: "application/json",
     },
+    // важно: если API вернет HTML/ошибку прокси — поймаем как текст в catch ниже
+    responseType: "json",
+    validateStatus: () => true,
   });
-  return r.data;
+
+  if (r.status >= 200 && r.status < 300) {
+    return { ok: true, data: r.data, request: { url, body } };
+  }
+
+  // иногда API может вернуть html в data как строку — дадим понятную ошибку
+  const details =
+    (typeof r.data === "string" ? r.data.slice(0, 400) : r.data?.message || r.data?.error) ||
+    `HTTP ${r.status}`;
+
+  return { ok: false, error: "Marketing API error", status: r.status, details, request: { url, body } };
 }
 
-// “за всё время”: пробуем окна и возвращаем первое успешное
-async function fetchMarketingAllTimeBase({ token, baseBody }) {
-  const end = new Date();
-  const windowsDays = [3650, 1825, 1095, 730, 365, 180, 90, 30];
-  let lastErr = null;
+function extractPerCarTotal(marketingData, stockCardId) {
+  const stats = Array.isArray(marketingData?.stats) ? marketingData.stats : [];
+  const idNum = Number(stockCardId);
 
-  for (const days of windowsDays) {
-    const start = addDays(end, -days);
-    const body = {
-      ...baseBody,
-      startDate: toISODate(start),
-      endDate: toISODate(end),
-    };
+  // groupBy в доке — значение, по которому сгруппировано. Для grouping stockCardId там будет stockCardId.
+  const row =
+    stats.find((x) => Number(x?.groupBy) === idNum) ||
+    stats.find((x) => String(x?.groupBy) === String(stockCardId));
 
-    try {
-      const data = await postMarketing({ token, body });
-      return {
-        ok: true,
-        period: { startDate: body.startDate, endDate: body.endDate, mode: `auto-${days}d` },
-        data,
-        requestBody: body,
-      };
-    } catch (e) {
-      lastErr = e;
-      continue;
-    }
-  }
+  if (!row) return null;
 
-  return {
-    ok: false,
-    message: "Маркетинг не удалось получить",
-    details: lastErr?.response?.data?.message || lastErr?.message || "Unknown error",
-    requestBody: baseBody,
-  };
-}
-
-// Главная магия: пытаемся получить маркетинг именно по 1 машине
-async function fetchMarketingForOneCarAllTime({ token, dealerId, siteSource, carFilter }) {
-  const dealerIdNum = Number(dealerId);
-  const base = {
-    grouping: "periodDay",
-    dealerIds: [dealerIdNum],
-    siteSource: siteSource ?? null,
-  };
-
-  // ВАРИАНТЫ ФИЛЬТРА (мы не знаем точное поле из доки, поэтому пробуем несколько)
-  // carFilter = { stockCarId?, stockCardId?, carId?, id? }
-  const candidates = [];
-
-  // самый вероятный
-  if (carFilter?.stockCarId != null) {
-    candidates.push({ field: "stockCarIds", value: [Number(carFilter.stockCarId)] });
-    candidates.push({ field: "stockCarId", value: Number(carFilter.stockCarId) }); // на случай если API так
-  }
-  if (carFilter?.stockCardId != null) {
-    candidates.push({ field: "stockCardIds", value: [Number(carFilter.stockCardId)] });
-    candidates.push({ field: "stockCardId", value: Number(carFilter.stockCardId) });
-  }
-  if (carFilter?.carId != null) {
-    candidates.push({ field: "carIds", value: [Number(carFilter.carId)] });
-    candidates.push({ field: "carId", value: Number(carFilter.carId) });
-  }
-  if (carFilter?.id != null) {
-    candidates.push({ field: "ids", value: [Number(carFilter.id)] });
-    candidates.push({ field: "id", value: Number(carFilter.id) });
-  }
-
-  // 1) если есть кандидаты — пробуем по ним, пока не получим “живой” total
-  for (const cand of candidates) {
-    const attempt = await fetchMarketingAllTimeBase({
-      token,
-      baseBody: { ...base, [cand.field]: cand.value },
-    });
-
-    if (attempt.ok) {
-      const total = attempt.data?.total || null;
-      // если total не пустой — считаем что попали в нужный фильтр
-      if (!isEmptyTotal(total)) {
-        return {
-          ok: true,
-          period: attempt.period,
-          data: attempt.data,
-          usedFilter: cand,
-          requestBody: attempt.requestBody,
-        };
-      }
-      // total нулевой — возможно не тот ключ, пробуем дальше
-    }
-  }
-
-  // 2) fallback: если фильтра нет или все не подошли — возвращаем по дилеру, но помечаем как fallback
-  const dealerOnly = await fetchMarketingAllTimeBase({ token, baseBody: base });
-
-  return {
-    ok: dealerOnly.ok,
-    period: dealerOnly.period,
-    data: dealerOnly.data,
-    usedFilter: null,
-    requestBody: dealerOnly.requestBody,
-    warning: "Не удалось применить фильтр по конкретному авто — показаны агрегированные данные по дилеру (dealerIds).",
-    details: dealerOnly.details,
-  };
+  return normalizeStatsEntry(row);
 }
 
 // -------------------- logo: /logo --------------------
 const AUTOPORTRAIT_LOGO_B64 =
-  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAoHBwgHBhYICAgWFhYVGBcaGBUYGSAeGhcYHRkdHRkfHx8jIi0lHx4oHh8XJTUlKS0vMjIyHSI4PTcwPS4xMi8BCgoKDg0OGxAQGy0lICUtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAWgB4AMBIgACEQEDEQH/xAAbAAACAgMBAAAAAAAAAAAAAAADBAUCBgEHAf/EADoQAAIBAgQDBgMGBwAAAAAAAAECAwQRAAUSITFBBhMiUWEHFDKBkaGxByNCUmLB0SNTYoKy8RVDc4L/xAAYAQADAQEAAAAAAAAAAAAAAAAAAQAFAgP/xAAgEQADAQEBAAIDAQAAAAAAAAAAAQIRAyESMQQiQVFh/9oADAMBAAIRAxEAPwD1yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k=";
+  "/9j/4AAQSkZJRgABAQAAAQABAAD/2wCEAAoHBwgHBhYICAgWFhYVGBcaGBUYGSAeGhcYHRkdHRkfHx8jIi0lHx4oHh8XJTUlKS0vMjIyHSI4PTcwPS4xMi8BCgoKDg0OGxAQGy0lICUtLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLf/AABEIAWgB4AMBIgACEQEDEQH/xAAbAAACAgMBAAAAAAAAAAAAAAADBAUCBgEHAf/EADoQAAIBAgQDBgMGBwAAAAAAAAECAwQRAAUSITFBBhMiUWEHFDKBkaGxByNCUmLB0SNTYoKy8RVDc4L/xAAYAQADAQEAAAAAAAAAAAAAAAAAAQAFAgP/xAAgEQADAQEBAAIDAQAAAAAAAAAAAQIRAyESMQQiQVFh/9oADAMBAAIRAxEAPwD1yAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/9k=";
 
 app.get("/logo", (req, res) => {
   const img = Buffer.from(AUTOPORTRAIT_LOGO_B64, "base64");
@@ -249,26 +192,21 @@ app.get("/logo", (req, res) => {
   res.status(200).send(img);
 });
 
-// -------------------- UI --------------------
+// -------------------- routes --------------------
+app.get("/health", (req, res) => res.json({ ok: true }));
+
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Автопортрет · Проверка по VIN</title>
+  <title>Автопортрет · VIN-проверка</title>
   <style>
     :root{
-      --card:#ffffff;
-      --text:#0b1220;
-      --muted:#667085;
-      --line:rgba(17, 24, 39, .08);
-      --brand:#0a3f47;
-      --brand2:#0f6b77;
-      --accent:#ff5a2c;
-      --ok:#12b76a;
-      --shadow: 0 18px 50px rgba(2, 6, 23, .10);
-      --radius: 18px;
+      --card:#ffffff; --text:#0b1220; --muted:#667085; --line:rgba(17, 24, 39, .08);
+      --brand:#0a3f47; --brand2:#0f6b77; --accent:#ff5a2c; --ok:#12b76a;
+      --shadow: 0 18px 50px rgba(2, 6, 23, .10); --radius: 18px;
     }
     *{box-sizing:border-box}
     body{
@@ -342,7 +280,6 @@ app.get("/", (req, res) => {
     .kv .v{font-weight:900; font-size:13px}
     .error{padding:14px 16px; border-radius:16px; border:1px solid rgba(240,68,56,.25); background:rgba(240,68,56,.07); color:#7a271a; font-weight:800;}
     .details{margin-top:10px; padding:12px 14px; border-radius:14px; background:rgba(240,68,56,.06); border:1px solid rgba(240,68,56,.16); color:#7a271a; font-size:12px; white-space:pre-wrap; font-weight:600;}
-    .warn{padding:12px 14px; border-radius:14px; background:rgba(247,144,9,.10); border:1px solid rgba(247,144,9,.22); color:#7a4b00; font-weight:800; margin-top:10px;}
     .skeleton{padding:18px; color:var(--muted); font-weight:800;}
     .footer{margin-top:14px; padding:14px 0 0; color:rgba(102,112,133,.92); font-size:12px; display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap;}
     .footer b{color:var(--brand)}
@@ -355,16 +292,16 @@ app.get("/", (req, res) => {
         <div class="logo"><img alt="Автопортрет" src="/logo"/></div>
         <div class="brandText">
           <div class="name">Автопортрет</div>
-          <div class="sub">Проверка автомобиля по VIN · Маркетинг и классифайды</div>
+          <div class="sub">Проверка автомобиля по VIN · Маркетинг (по stockCardId)</div>
         </div>
       </div>
-      <div class="badge"><span class="dot"></span> API online · маркетинг (по авто, если возможно)</div>
+      <div class="badge"><span class="dot"></span> API online · период: последние 30 дней</div>
     </div>
 
     <div class="card hero">
       <div class="heroLeft">
         <h1>VIN-проверка</h1>
-        <p>Достаём автомобиль из <b>CM.Expert</b> и пытаемся получить маркетинг <b>по конкретной карточке</b> (а не по всему дилеру). Если API не даёт фильтр — покажем предупреждение.</p>
+        <p>Маркетинг получаем по <b>stockCardId</b> (как в инструкции). API ограничивает период ~31 день — используем последние <b>30 дней</b>.</p>
       </div>
     </div>
 
@@ -374,7 +311,7 @@ app.get("/", (req, res) => {
         <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить</button>
         <button class="btn btn-ghost" onclick="resetAll()">Очистить</button>
       </div>
-      <div class="hint">VIN строго <b>17</b> символов. Графиков нет — только totals + классифайды.</div>
+      <div class="hint">VIN строго <b>17</b> символов. Период маркетинга: <b>последние 30 дней</b>. Классифайды включены.</div>
     </div>
 
     <div id="out"></div>
@@ -420,7 +357,6 @@ async function fetchAny(url){
   try { json = JSON.parse(text); } catch(e) {}
   return { ok: r.ok, status: r.status, text, json };
 }
-
 function srcCard(marketing, key, label){
   const t = marketing?.bySource?.[key]?.total || null;
   if(!t){
@@ -442,7 +378,6 @@ function srcCard(marketing, key, label){
       <div class="kv"><div class="k">Расходы</div><div class="v">\${sum != null ? formatMoney(sum) : '—'}</div></div>
     </div>\`;
 }
-
 function renderMarketing(marketing){
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг недоступен';
@@ -454,38 +389,31 @@ function renderMarketing(marketing){
   const chats = total.chats || {};
   const sum = (total.sumWithBonusesExpenses ?? total.sumExpenses);
 
-  const warn = marketing.warning ? '<div class="warn">' + esc(marketing.warning) + '</div>' : '';
-  const filter = marketing.usedFilter ? ('Фильтр: ' + marketing.usedFilter.field + '=' + JSON.stringify(marketing.usedFilter.value)) : 'Фильтр: —';
-
   return \`
     <div class="section">
       <div class="sectionTitle">Маркетинг</div>
       <div class="meta">
         <span class="pill"><span class="k">Период</span> <b>\${esc(marketing.period?.startDate)} — \${esc(marketing.period?.endDate)}</b></span>
-        <span class="pill"><span class="k">Режим</span> <b>\${esc(marketing.period?.mode || 'auto')}</b></span>
-        <span class="pill"><span class="k">\${esc(filter)}</span></span>
+        <span class="pill"><span class="k">grouping</span> <b>\${esc(marketing.grouping || 'stockCardId')}</b></span>
+        <span class="pill"><span class="k">stockCardId</span> <b>\${esc(marketing.stockCardId ?? '—')}</b></span>
       </div>
-      \${warn}
 
       <div class="marketingGrid">
         <div class="metric">
           <div class="label">Просмотры</div>
           <div class="value">\${formatNum(total.views)}</div>
-          <div class="subv">Суммарно за доступный период.</div>
+          <div class="subv">По конкретной карточке.</div>
         </div>
-
         <div class="metric">
           <div class="label">Чаты</div>
           <div class="value">\${formatNum(chats.total)}</div>
           <div class="subv">Пропущено: <b>\${formatNum(chats.missed)}</b> · Платные: <b>\${formatNum(chats.targeted)}</b></div>
         </div>
-
         <div class="metric">
           <div class="label">Расходы всего (с бонусами)</div>
           <div class="value">\${sum != null ? formatMoney(sum) : '—'}</div>
-          <div class="subv">Итоговый расход.</div>
+          <div class="subv">Суммарно по карточке.</div>
         </div>
-
         <div class="metric">
           <div class="label">Структура расходов</div>
           <div class="value" style="font-size:16px; line-height:1.35">
@@ -546,6 +474,7 @@ async function checkVin(){
               <div class="meta">
                 <span class="pill"><span class="k">VIN</span> <b>\${esc(vin)}</b></span>
                 <span class="pill"><span class="k">dealerId</span> <b>\${esc(data.dealerId ?? '—')}</b></span>
+                <span class="pill"><span class="k">stockCardId</span> <b>\${esc(data.stockCardId ?? '—')}</b></span>
               </div>
             </div>
           </div>
@@ -573,7 +502,7 @@ async function checkVin(){
 </html>`);
 });
 
-// -------------------- /check-vin --------------------
+// VIN -> авто + маркетинг по stockCardId
 app.get("/check-vin", async (req, res) => {
   res.type("json");
 
@@ -590,78 +519,80 @@ app.get("/check-vin", async (req, res) => {
     });
 
     const c = carResponse.data || {};
+    const dealerId = c.dealerId ?? null;
 
-    // 2) пытаемся понять ID карточки/стока в ответе
-    // Приоритетные ключи — самые вероятные варианты
-    const preferred = ["stockCarId", "stockCardId", "carId", "id", "stock_id", "cardId", "offerId", "advertId"];
-    const found = pickFirstIdLike(c, preferred);
+    // 2) stockCardId (ключ для правильной выборки из marketing.stats[])
+    const foundStockCard = pickStockCardId(c);
+    const stockCardId = foundStockCard?.value ?? null;
 
-    // Собираем структуру фильтра для маркетинга
-    const carFilter = {
-      stockCarId: c.stockCarId ?? null,
-      stockCardId: c.stockCardId ?? null,
-      carId: c.carId ?? null,
-      id: c.id ?? null,
-    };
+    // период строго 30 дней (по доке)
+    const endDate = toISODate(new Date());
+    const startDate = toISODate(addDays(new Date(), -30));
 
-    // если прямых полей нет — используем то, что нашли рекурсивно, как "id"
-    if (carFilter.stockCarId == null && carFilter.stockCardId == null && carFilter.carId == null && carFilter.id == null) {
-      if (found?.value != null) carFilter.id = found.value;
-    }
-
-    // 3) маркетинг + классифайды (по авто, если получится)
     let marketing = { ok: false, message: "Маркетинг не удалось получить" };
 
-    if (c.dealerId != null) {
-      const base = await fetchMarketingForOneCarAllTime({
-        token,
-        dealerId: c.dealerId,
-        siteSource: null,
-        carFilter,
-      });
-
-      if (base.ok) {
-        const sources = ["auto.ru", "avito.ru", "drom.ru"];
-        const tasks = sources.map((s) =>
-          fetchMarketingForOneCarAllTime({
+    if (!dealerId) {
+      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
+    } else if (!stockCardId) {
+      marketing = {
+        ok: false,
+        message: "Не найден stockCardId в ответе find-last-by-car — по доке он нужен для группировки",
+        details: "Проверь, что find-last-by-car возвращает stockCardId (иногда он вложен).",
+      };
+    } else {
+      // базовый маркетинг (siteSource: null) + классифайды
+      const sources = [null, "auto.ru", "avito.ru", "drom.ru"];
+      const results = await Promise.all(
+        sources.map((s) =>
+          fetchMarketingStockCars({
             token,
-            dealerId: c.dealerId,
+            dealerId,
             siteSource: s,
-            carFilter,
+            startDate,
+            endDate,
           })
-        );
+        )
+      );
 
-        const results = await Promise.allSettled(tasks);
+      const base = results[0];
+      if (!base.ok) {
+        marketing = {
+          ok: false,
+          message: "Маркетинг не удалось получить",
+          details: base.details || base.error || "Unknown",
+        };
+      } else {
+        // ВНИМАНИЕ: берём НЕ total, а строку из stats[] по groupBy==stockCardId
+        const perCarTotal = extractPerCarTotal(base.data, stockCardId);
 
+        // классифайды: то же самое
         const bySource = {};
-        sources.forEach((s, idx) => {
-          const rr = results[idx];
-          if (rr.status === "fulfilled" && rr.value?.ok) {
-            bySource[s] = { ok: true, total: rr.value?.data?.total || null };
+        const srcKeys = ["auto.ru", "avito.ru", "drom.ru"];
+        for (let i = 0; i < srcKeys.length; i++) {
+          const rr = results[i + 1];
+          if (rr.ok) {
+            bySource[srcKeys[i]] = {
+              ok: true,
+              total: extractPerCarTotal(rr.data, stockCardId),
+            };
           } else {
-            bySource[s] = { ok: false, total: null };
+            bySource[srcKeys[i]] = { ok: false, total: null };
           }
-        });
+        }
 
         marketing = {
           ok: true,
-          grouping: "periodDay",
-          period: base.period,
-          total: base.data?.total || null,
+          grouping: "stockCardId",
+          period: { startDate, endDate },
+          stockCardId,
+          total: perCarTotal, // <-- правильные данные по карточке
           bySource,
-          dealerId: Number(c.dealerId),
-          usedFilter: base.usedFilter,
-          warning: base.warning || null,
           debug: {
-            foundId: found || null,
-            carFilter,
+            stockCardIdFoundAt: foundStockCard?.path || null,
+            note: "total взят из data.stats[] (groupBy==stockCardId), а не из data.total",
           },
         };
-      } else {
-        marketing = base;
       }
-    } else {
-      marketing = { ok: false, message: "Нет dealerId в ответе — маркетинг не запросить" };
     }
 
     return res.send(
@@ -674,13 +605,15 @@ app.get("/check-vin", async (req, res) => {
         modificationName: c.modificationName,
         mileage: c.mileage,
         color: c.color,
-        dealerId: c.dealerId ?? null,
+        dealerId,
+        stockCardId,
         marketing,
       })
     );
   } catch (error) {
     const status = error?.response?.status || 500;
     const data = error?.response?.data;
+
     return res.status(status).send(
       JSON.stringify({
         ok: false,
