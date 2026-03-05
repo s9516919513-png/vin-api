@@ -42,6 +42,37 @@ function mkKey(parts) {
   return parts.map((x) => String(x ?? "")).join("|");
 }
 
+// ✅ inclusive periods: N days = [today-(N-1) ... today]
+function makeInclusiveRange(days, endDateObj = new Date()) {
+  const end = new Date(endDateObj);
+  const start = addDays(end, -(days - 1));
+  return { startDate: toISODate(start), endDate: toISODate(end) };
+}
+
+// ✅ split into NON-overlapping inclusive chunks of 30 days
+function makeChunks(days, endDateObj = new Date()) {
+  days = clamp(days, 1, 90);
+
+  const end = new Date(endDateObj);
+  if (days <= 30) {
+    return [makeInclusiveRange(days, end)];
+  }
+
+  // 90 = 3 chunks * 30 days (inclusive)
+  // chunk1: end = today, start = today-29
+  // chunk2: end = today-30, start = today-59
+  // chunk3: end = today-60, start = today-89
+  const chunk1End = end;
+  const chunk2End = addDays(end, -30);
+  const chunk3End = addDays(end, -60);
+
+  return [
+    makeInclusiveRange(30, chunk1End),
+    makeInclusiveRange(30, chunk2End),
+    makeInclusiveRange(30, chunk3End),
+  ];
+}
+
 // -------------------- health --------------------
 app.get("/health", (req, res) => res.json({ ok: true, ts: Date.now() }));
 
@@ -50,15 +81,10 @@ let tokenCache = { token: null, expiresAt: 0 };
 
 async function getToken() {
   const now = Date.now();
-
-  if (tokenCache.token && now < tokenCache.expiresAt - 10_000) {
-    return tokenCache.token;
-  }
+  if (tokenCache.token && now < tokenCache.expiresAt - 10_000) return tokenCache.token;
 
   const clientId = process.env.CLIENT_ID;
   const clientSecret = process.env.CLIENT_SECRET;
-
-  // Не падаем на старте — но запросы к API будут отдавать понятную ошибку
   if (!clientId || !clientSecret) {
     const err = new Error("Missing CLIENT_ID or CLIENT_SECRET env vars");
     err.status = 500;
@@ -84,7 +110,6 @@ async function getToken() {
 
 // -------------------- marketing cache (TTL) --------------------
 const marketingCache = new Map();
-
 function cacheGet(key) {
   const hit = marketingCache.get(key);
   if (!hit) return null;
@@ -100,7 +125,6 @@ function cacheSet(key, value, ttlMs) {
 
 // -------------------- marketing API --------------------
 async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
-  // ВАЖНО: dealerIds как ЧИСЛА, иначе CM.Expert нередко отдаёт пусто/ошибку
   const dealerIdNum = Number(dealerId);
   if (!Number.isFinite(dealerIdNum)) {
     const err = new Error("Invalid dealerId (must be a number)");
@@ -130,14 +154,14 @@ async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource 
 // суммирование total по кускам
 function sumTotals(a, b) {
   const out = { ...(a || {}) };
-  out.views = (a?.views || 0) + (b?.views || 0);
+  out.views = Number(a?.views || 0) + Number(b?.views || 0);
 
   const ac = a?.chats || {};
   const bc = b?.chats || {};
   out.chats = {
-    total: (ac.total || 0) + (bc.total || 0),
-    missed: (ac.missed || 0) + (bc.missed || 0),
-    targeted: (ac.targeted || 0) + (bc.targeted || 0),
+    total: Number(ac.total || 0) + Number(bc.total || 0),
+    missed: Number(ac.missed || 0) + Number(bc.missed || 0),
+    targeted: Number(ac.targeted || 0) + Number(bc.targeted || 0),
   };
 
   const fields = [
@@ -148,12 +172,12 @@ function sumTotals(a, b) {
     "chatsExpenses",
     "tariffsExpenses",
   ];
-  for (const f of fields) out[f] = (a?.[f] || 0) + (b?.[f] || 0);
+  for (const f of fields) out[f] = Number(a?.[f] || 0) + Number(b?.[f] || 0);
 
   return out;
 }
 
-// объединение stats по дате (если пересечения)
+// объединение stats по дате (без двойного счёта)
 function mergeStats(statsArr) {
   const m = new Map(); // date -> item
   for (const it of statsArr || []) {
@@ -164,43 +188,27 @@ function mergeStats(statsArr) {
     if (!prev) {
       m.set(date, JSON.parse(JSON.stringify(it)));
     } else {
-      prev.views = (prev.views || 0) + (it.views || 0);
-      prev.sumExpenses = (prev.sumExpenses || 0) + (it.sumExpenses || 0);
+      prev.views = Number(prev.views || 0) + Number(it.views || 0);
+      prev.sumExpenses = Number(prev.sumExpenses || 0) + Number(it.sumExpenses || 0);
       prev.sumWithBonusesExpenses =
-        (prev.sumWithBonusesExpenses || 0) + (it.sumWithBonusesExpenses || 0);
+        Number(prev.sumWithBonusesExpenses || 0) + Number(it.sumWithBonusesExpenses || 0);
 
       const pc = prev.chats || {};
       const ic = it.chats || {};
       prev.chats = {
-        total: (pc.total || 0) + (ic.total || 0),
-        missed: (pc.missed || 0) + (ic.missed || 0),
-        targeted: (pc.targeted || 0) + (ic.targeted || 0),
+        total: Number(pc.total || 0) + Number(ic.total || 0),
+        missed: Number(pc.missed || 0) + Number(ic.missed || 0),
+        targeted: Number(pc.targeted || 0) + Number(ic.targeted || 0),
       };
     }
   }
   return Array.from(m.values()).sort((x, y) => String(x.date).localeCompare(String(y.date)));
 }
 
-// сборка маркетинга (7/30/90; 90 = 3×30)
+// сборка маркетинга
 async function getMarketingBundle({ token, dealerId, days }) {
   days = clamp(days || 30, 1, 90);
-  const today = new Date();
-
-  const chunks = [];
-  if (days <= 30) {
-    chunks.push({ startDate: toISODate(addDays(today, -days)), endDate: toISODate(today) });
-  } else {
-    chunks.push({ startDate: toISODate(addDays(today, -30)), endDate: toISODate(today) });
-    chunks.push({
-      startDate: toISODate(addDays(today, -60)),
-      endDate: toISODate(addDays(today, -30)),
-    });
-    chunks.push({
-      startDate: toISODate(addDays(today, -90)),
-      endDate: toISODate(addDays(today, -60)),
-    });
-  }
-
+  const chunks = makeChunks(days, new Date());
   const sources = ["auto.ru", "avito.ru", "drom.ru"];
 
   let total = null;
@@ -213,7 +221,6 @@ async function getMarketingBundle({ token, dealerId, days }) {
   let lastError = null;
 
   for (const ch of chunks) {
-    // параллельно: base + источники
     const tasks = [
       fetchMarketing({ token, dealerId, ...ch, siteSource: null }),
       ...sources.map((s) => fetchMarketing({ token, dealerId, ...ch, siteSource: s })),
@@ -221,7 +228,6 @@ async function getMarketingBundle({ token, dealerId, days }) {
 
     const results = await Promise.allSettled(tasks);
 
-    // base
     if (results[0].status === "fulfilled") {
       anySuccess = true;
       const base = results[0].value;
@@ -231,7 +237,6 @@ async function getMarketingBundle({ token, dealerId, days }) {
       lastError = results[0].reason;
     }
 
-    // sources
     sources.forEach((s, idx) => {
       const rr = results[idx + 1];
       if (rr.status === "fulfilled") {
@@ -245,7 +250,6 @@ async function getMarketingBundle({ token, dealerId, days }) {
     });
   }
 
-  // КЛЮЧ: если все запросы упали — возвращаем ok:false, чтобы фронт показал причину
   if (!anySuccess) {
     const status = lastError?.response?.status || lastError?.status || 500;
     const msg =
@@ -256,11 +260,8 @@ async function getMarketingBundle({ token, dealerId, days }) {
     return { ok: false, status, message: msg };
   }
 
-  const period = {
-    startDate: toISODate(addDays(new Date(), -days)),
-    endDate: toISODate(new Date()),
-    days,
-  };
+  const period = makeInclusiveRange(days, new Date());
+  period.days = days;
 
   const bySource = {};
   for (const s of sources) {
@@ -396,7 +397,6 @@ h1{
 }
 .kpi .label{color:var(--muted); font-size:12px; margin-bottom:6px}
 .kpi .value{font-size:22px; font-weight:900}
-.kpi .hint{color:var(--muted); font-size:12px; margin-top:6px}
 
 @media(max-width:900px){ .kpi{grid-column:span 6} }
 @media(max-width:560px){ .kpi{grid-column:span 12} h1{font-size:30px} }
@@ -451,7 +451,7 @@ hr.sep{
   <div class="header">
     <div>
       <h1>Проверка автомобиля по VIN</h1>
-      <div class="sub">Авто → CM.Expert API · Маркетинг → marketing-statistics · Графики и фильтр периода</div>
+      <div class="sub">VIN → авто · dealerId → маркетинг · фильтр 7/30/90 · графики</div>
     </div>
   </div>
 
@@ -749,7 +749,11 @@ app.get("/check-vin", async (req, res) => {
     });
   } catch (e) {
     const status = e?.status || e?.response?.status || 500;
-    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "VIN request failed";
+    const msg =
+      e?.response?.data?.message ||
+      e?.response?.data?.error ||
+      e?.message ||
+      "VIN request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
@@ -774,18 +778,21 @@ app.get("/marketing", async (req, res) => {
     const token = await getToken();
     const marketing = await getMarketingBundle({ token, dealerId, days });
 
-    // кэш: ok=10 минут; ошибка=1 минута (чтобы не долбить API)
+    // кэш: ok=10 минут; ошибка=1 минута
     cacheSet(key, marketing, marketing.ok ? 10 * 60 * 1000 : 60 * 1000);
 
     if (!marketing.ok) {
-      // ВАЖНО: отдаём ошибку, чтобы фронт показал причину, а не "—"
       return res.status(502).json({ ok: false, message: marketing.message, status: marketing.status });
     }
 
     return res.json({ ok: true, cached: false, marketing });
   } catch (e) {
     const status = e?.response?.status || 500;
-    const msg = e?.response?.data?.message || e?.response?.data?.error || e?.message || "Marketing request failed";
+    const msg =
+      e?.response?.data?.message ||
+      e?.response?.data?.error ||
+      e?.message ||
+      "Marketing request failed";
     return res.status(status).json({ ok: false, message: msg, status });
   }
 });
