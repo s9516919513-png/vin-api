@@ -4,14 +4,12 @@ const axios = require("axios");
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// -------------------- axios (сырой текст, парсим сами) --------------------
+// -------------------- axios: ВСЕГДА текст --------------------
 const http = axios.create({
-  timeout: 20000,
-  // важно: не пытаться парсить как json автоматически
+  timeout: 25000,
   responseType: "text",
-  transformResponse: [(d) => d],
-  // пусть ошибки 4xx/5xx тоже вернутся в ответе (мы сами обработаем)
-  validateStatus: () => true,
+  transformResponse: [(d) => d], // не парсим автоматически
+  validateStatus: () => true, // 4xx/5xx тоже возвращаем телом
 });
 
 // -------------------- CORS --------------------
@@ -36,22 +34,10 @@ function addDays(date, days) {
   d.setDate(d.getDate() + days);
   return d;
 }
-
-function snippet(s, n = 600) {
+function snippet(s, n = 900) {
   const t = String(s ?? "");
   return t.length > n ? t.slice(0, n) + "…" : t;
 }
-
-function baseHeaders(extra = {}) {
-  // иногда WAF/прокси “не любит” пустой User-Agent/Accept
-  return {
-    Accept: "application/json, text/plain, */*",
-    "User-Agent":
-      "Mozilla/5.0 (compatible; VIN-Checker/1.0; +https://example.invalid)",
-    ...extra,
-  };
-}
-
 function tryParseJson(text) {
   try {
     return { ok: true, json: JSON.parse(text) };
@@ -60,36 +46,47 @@ function tryParseJson(text) {
   }
 }
 
-async function postJson(url, body, headers) {
-  const r = await http.post(url, body, { headers: baseHeaders(headers) });
+function browserHeaders(extra = {}) {
+  // “как браузер” — часто это важно для lk.* доменов
+  return {
+    Accept: "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+    "User-Agent":
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    Origin: "https://lk.cm.expert",
+    Referer: "https://lk.cm.expert/",
+    ...extra,
+  };
+}
 
+async function postExpectJson(url, body, headers) {
+  const r = await http.post(url, body, { headers: browserHeaders(headers) });
   const contentType = r.headers?.["content-type"] || "";
   const status = r.status;
 
-  // если статус не 2xx — всё равно попробуем понять, что пришло
   const parsed = tryParseJson(r.data);
 
+  // если пришел HTML/текст — это твой кейс <!DOCTYPE ...>
   if (!parsed.ok) {
-    // это и есть твой кейс: пришёл HTML ("<!DOCTYPE ...")
-    const err = new Error(
-      `CM.Expert returned non-JSON (status ${status}, content-type: ${contentType})`
-    );
+    const err = new Error(`Non-JSON response from ${url} (status ${status})`);
     err.kind = "NON_JSON";
     err.status = status;
+    err.url = url;
     err.contentType = contentType;
-    err.bodySnippet = snippet(r.data, 900);
+    err.bodySnippet = snippet(r.data, 1200);
     throw err;
   }
 
+  // JSON есть, но может быть ошибка API (4xx/5xx)
   if (status < 200 || status >= 300) {
-    // JSON есть, но это ошибка API
     const err = new Error(
       parsed.json?.message ||
         parsed.json?.error ||
-        `CM.Expert error status ${status}`
+        `API error from ${url} (status ${status})`
     );
     err.kind = "API_ERROR";
     err.status = status;
+    err.url = url;
     err.apiBody = parsed.json;
     throw err;
   }
@@ -97,21 +94,19 @@ async function postJson(url, body, headers) {
   return parsed.json;
 }
 
-async function getJson(url, params, headers) {
-  const r = await http.get(url, { params, headers: baseHeaders(headers) });
-
+async function getExpectJson(url, params, headers) {
+  const r = await http.get(url, { params, headers: browserHeaders(headers) });
   const contentType = r.headers?.["content-type"] || "";
   const status = r.status;
-  const parsed = tryParseJson(r.data);
 
+  const parsed = tryParseJson(r.data);
   if (!parsed.ok) {
-    const err = new Error(
-      `CM.Expert returned non-JSON (status ${status}, content-type: ${contentType})`
-    );
+    const err = new Error(`Non-JSON response from ${url} (status ${status})`);
     err.kind = "NON_JSON";
     err.status = status;
+    err.url = url;
     err.contentType = contentType;
-    err.bodySnippet = snippet(r.data, 900);
+    err.bodySnippet = snippet(r.data, 1200);
     throw err;
   }
 
@@ -119,10 +114,11 @@ async function getJson(url, params, headers) {
     const err = new Error(
       parsed.json?.message ||
         parsed.json?.error ||
-        `CM.Expert error status ${status}`
+        `API error from ${url} (status ${status})`
     );
     err.kind = "API_ERROR";
     err.status = status;
+    err.url = url;
     err.apiBody = parsed.json;
     throw err;
   }
@@ -135,11 +131,10 @@ let tokenCache = { token: null, expiresAt: 0 };
 
 async function getToken() {
   const now = Date.now();
-  if (tokenCache.token && now < tokenCache.expiresAt - 10_000) {
-    return tokenCache.token;
-  }
+  if (tokenCache.token && now < tokenCache.expiresAt - 10_000) return tokenCache.token;
 
-  const tokenJson = await postJson(
+  // oauth обычно нормально работает на lk.cm.expert
+  const tokenJson = await postExpectJson(
     "https://lk.cm.expert/oauth/token",
     new URLSearchParams({
       grant_type: "client_credentials",
@@ -156,116 +151,128 @@ async function getToken() {
   return token;
 }
 
-// -------------------- marketing API (логика как у тебя, но безопасный парсинг) --------------------
-async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
-  const url = "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars";
+// -------------------- API endpoints (по доке часто есть отдельный api домен) --------------------
+const ENDPOINTS = {
+  carFindLastByVin: [
+    "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
+    "https://api.cm.expert/api/v1/car/appraisal/find-last-by-car", // fallback
+  ],
+  marketingStockCars: [
+    "https://lk.cm.expert/api/v1/marketing-statistics/stock-cars",
+    "https://api.cm.expert/api/v1/marketing-statistics/stock-cars", // fallback
+  ],
+};
 
+async function fetchCarByVin({ token, vin }) {
+  let lastErr = null;
+  for (const url of ENDPOINTS.carFindLastByVin) {
+    try {
+      return await getExpectJson(url, { vin }, { Authorization: `Bearer ${token}` });
+    } catch (e) {
+      lastErr = e;
+      // если не JSON/гейтвей — пробуем следующий url
+      continue;
+    }
+  }
+  throw lastErr || new Error("Car API failed");
+}
+
+async function fetchMarketing({ token, dealerId, startDate, endDate, siteSource = null }) {
   const body = {
     grouping: "periodDay",
-    dealerIds: [dealerId], // оставляем как в рабочей версии
+    dealerIds: [dealerId], // как у тебя в рабочей версии
     siteSource,
     startDate,
     endDate,
   };
 
-  const data = await postJson(url, body, {
-    Authorization: `Bearer ${token}`,
-    "Content-Type": "application/json",
-  });
-
-  return { ok: true, data, request: { url, body } };
+  let lastErr = null;
+  for (const url of ENDPOINTS.marketingStockCars) {
+    try {
+      const data = await postExpectJson(url, body, {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+      });
+      return { ok: true, data, request: { url, body } };
+    } catch (e) {
+      lastErr = e;
+      continue;
+    }
+  }
+  throw lastErr || new Error("Marketing API failed");
 }
 
-// -------------------- routes --------------------
-app.get("/health", (req, res) => res.json({ ok: true }));
-
+// -------------------- UI --------------------
 app.get("/", (req, res) => {
   res.type("html").send(`<!doctype html>
 <html lang="ru">
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Проверка авто по VIN</title>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    :root{
-      --bg:#f5f6fb; --card:#fff; --muted:#6b7280; --text:#0f172a;
-      --accent:#ff5a2c; --border:#e5e7eb;
-    }
-    *{box-sizing:border-box}
-    body{
-      margin:0;
-      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-      background: radial-gradient(1200px 700px at 20% -10%, #ffe7de 0%, rgba(255,231,222,0) 55%),
-                  radial-gradient(900px 600px at 90% 0%, #e8efff 0%, rgba(232,239,255,0) 55%),
-                  var(--bg);
-      color:var(--text);
-    }
-    .container{max-width:1100px;margin:40px auto;padding:0 16px;}
-    h1{font-size:38px;margin:0;letter-spacing:-.02em}
-    .sub{margin:8px 0 0;color:var(--muted);font-size:14px}
-    .card{
-      background:var(--card);
-      border:1px solid rgba(229,231,235,.8);
-      border-radius:18px;
-      padding:18px;
-      box-shadow:0 14px 40px rgba(15,23,42,.06);
-      margin-top:16px;
-    }
-    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-    .input{
-      flex:1;min-width:260px;
-      padding:14px 14px;border-radius:12px;border:1px solid var(--border);
-      outline:none;font-size:16px;background:#fff;
-    }
-    .btn{padding:12px 14px;border-radius:12px;border:none;font-weight:800;cursor:pointer;}
-    .btn-primary{background:var(--accent);color:#fff}
-    .btn-ghost{background:#f3f4f6;color:#111827}
-    .btn:disabled{opacity:.6;cursor:not-allowed}
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Проверка авто по VIN</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<style>
+:root{--bg:#f5f6fb;--card:#fff;--muted:#6b7280;--text:#0f172a;--accent:#ff5a2c;--border:#e5e7eb;}
+*{box-sizing:border-box}
+body{
+  margin:0;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;color:var(--text);
+  background: radial-gradient(1200px 700px at 20% -10%, #ffe7de 0%, rgba(255,231,222,0) 55%),
+              radial-gradient(900px 600px at 90% 0%, #e8efff 0%, rgba(232,239,255,0) 55%),
+              var(--bg);
+}
+.container{max-width:1100px;margin:40px auto;padding:0 16px;}
+h1{font-size:38px;margin:0;letter-spacing:-.02em}
+.sub{margin:8px 0 0;color:var(--muted);font-size:14px}
+.card{background:var(--card);border:1px solid rgba(229,231,235,.8);border-radius:18px;padding:18px;box-shadow:0 14px 40px rgba(15,23,42,.06);margin-top:16px;}
+.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+.input{flex:1;min-width:260px;padding:14px 14px;border-radius:12px;border:1px solid var(--border);outline:none;font-size:16px;background:#fff;}
+.btn{padding:12px 14px;border-radius:12px;border:none;font-weight:800;cursor:pointer;}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-ghost{background:#f3f4f6;color:#111827}
+.btn:disabled{opacity:.6;cursor:not-allowed}
 
-    .titleRow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
-    .title{font-size:30px;font-weight:900;letter-spacing:-.02em;margin:0}
-    .muted{color:var(--muted);font-size:14px}
+.titleRow{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;align-items:flex-start}
+.title{font-size:30px;font-weight:900;letter-spacing:-.02em;margin:0}
+.muted{color:var(--muted);font-size:14px}
 
-    .grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
-    .kpi{grid-column:span 3;background:linear-gradient(180deg,#fff 0%, #fafafa 100%);border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;}
-    .kpi .label{color:var(--muted);font-size:12px;margin-bottom:6px}
-    .kpi .value{font-size:20px;font-weight:900}
-    @media(max-width:900px){.kpi{grid-column:span 6}}
-    @media(max-width:560px){.kpi{grid-column:span 12} h1{font-size:30px}}
+.grid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;margin-top:14px}
+.kpi{grid-column:span 3;background:linear-gradient(180deg,#fff 0%, #fafafa 100%);border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;}
+.kpi .label{color:var(--muted);font-size:12px;margin-bottom:6px}
+.kpi .value{font-size:20px;font-weight:900}
+@media(max-width:900px){.kpi{grid-column:span 6}}
+@media(max-width:560px){.kpi{grid-column:span 12} h1{font-size:30px}}
 
-    .sectionTitle{margin:18px 0 10px;font-size:18px;letter-spacing:-.01em}
-    .error{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;padding:12px 14px;border-radius:14px;}
-    .details{margin-top:8px;color:#991b1b;font-size:12px;white-space:pre-wrap}
-    hr.sep{border:0;height:1px;background:rgba(229,231,235,.9);margin:16px 0;}
-    .split{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;margin-top:12px}
-    @media(max-width:900px){.split{grid-template-columns:1fr}}
-    .panel{border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
-    .sourceGrid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
-    .sourceCard{grid-column:span 4;border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
-    @media(max-width:900px){.sourceCard{grid-column:span 6}}
-    @media(max-width:560px){.sourceCard{grid-column:span 12}}
-    .sourceCard .name{font-weight:900;font-size:16px;margin-bottom:8px}
-  </style>
+.sectionTitle{margin:18px 0 10px;font-size:18px;letter-spacing:-.01em}
+.error{background:#fff1f2;border:1px solid #fecdd3;color:#9f1239;padding:12px 14px;border-radius:14px;}
+.details{margin-top:8px;color:#991b1b;font-size:12px;white-space:pre-wrap}
+hr.sep{border:0;height:1px;background:rgba(229,231,235,.9);margin:16px 0;}
+.split{display:grid;grid-template-columns:1.4fr 1fr;gap:12px;margin-top:12px}
+@media(max-width:900px){.split{grid-template-columns:1fr}}
+.panel{border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
+.sourceGrid{display:grid;grid-template-columns:repeat(12,1fr);gap:12px}
+.sourceCard{grid-column:span 4;border:1px solid rgba(229,231,235,.9);border-radius:16px;padding:14px;background:#fff;}
+@media(max-width:900px){.sourceCard{grid-column:span 6}}
+@media(max-width:560px){.sourceCard{grid-column:span 12}}
+.sourceCard .name{font-weight:900;font-size:16px;margin-bottom:8px}
+</style>
 </head>
 <body>
-  <div class="container">
-    <div>
-      <h1>Проверка автомобиля по VIN</h1>
-      <div class="sub">Если CM.Expert вернул HTML вместо JSON — покажем причину (статус + кусок ответа).</div>
-    </div>
-
-    <div class="card">
-      <div class="row">
-        <input id="vin" class="input" placeholder="Введите VIN (17 символов)" maxlength="17"/>
-        <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить</button>
-        <button class="btn btn-ghost" onclick="resetAll()">Очистить</button>
-      </div>
-      <div class="muted" style="margin-top:10px">Период маркетинга: последние 30 дней.</div>
-    </div>
-
-    <div id="out"></div>
+<div class="container">
+  <div>
+    <h1>Проверка автомобиля по VIN</h1>
+    <div class="sub">Период маркетинга: последние 30 дней. Запросы к маркетингу делаем “как браузер” + fallback на api.cm.expert.</div>
   </div>
+
+  <div class="card">
+    <div class="row">
+      <input id="vin" class="input" placeholder="Введите VIN (17 символов)" maxlength="17"/>
+      <button id="btn" class="btn btn-primary" onclick="checkVin()">Проверить</button>
+      <button class="btn btn-ghost" onclick="resetAll()">Очистить</button>
+    </div>
+  </div>
+
+  <div id="out"></div>
+</div>
 
 <script>
 let chartLine=null, chartBars=null;
@@ -282,6 +289,7 @@ function resetAll(){
   if(chartBars){chartBars.destroy(); chartBars=null;}
 }
 
+// ✅ НИКОГДА не делаем response.json() — только text() + JSON.parse
 async function fetchMaybeJson(url){
   const r = await fetch(url, { cache:"no-store" });
   const text = await r.text();
@@ -307,8 +315,8 @@ function renderSourceCard(marketing, key){
 function renderMarketing(marketing){
   if(!marketing || marketing.ok === false){
     const msg = marketing?.message || 'Маркетинг недоступен';
-    const det = marketing?.details ? '<div class="details">' + esc(marketing.details) + '</div>' : '';
-    return '<hr class="sep"/><div class="error">' + esc(msg) + det + '</div>';
+    const det = marketing?.details ? '<div class="details">'+esc(marketing.details)+'</div>' : '';
+    return '<hr class="sep"/><div class="error">'+esc(msg)+det+'</div>';
   }
 
   const total = marketing.total || {};
@@ -402,10 +410,10 @@ async function checkVin(){
       out.innerHTML = '<div class="card"><div class="error">Сервер вернул НЕ JSON (status '+resp.status+')</div><div class="details">'+esc(resp.text.slice(0,700))+'</div></div>';
       return;
     }
-
     const data = resp.json;
+
     if(!resp.ok || data?.ok===false){
-      out.innerHTML = '<div class="card"><div class="error">' + esc(data?.message || data?.error || 'Ошибка запроса') + '</div></div>';
+      out.innerHTML = '<div class="card"><div class="error">'+esc(data?.message || data?.error || 'Ошибка запроса')+'</div></div>';
       return;
     }
 
@@ -453,14 +461,10 @@ app.get("/check-vin", async (req, res) => {
   try {
     const token = await getToken();
 
-    // 1) авто по VIN
-    const c = await getJson(
-      "https://lk.cm.expert/api/v1/car/appraisal/find-last-by-car",
-      { vin },
-      { Authorization: `Bearer ${token}` }
-    );
+    // 1) авто по VIN (с fallback на api.cm.expert)
+    const c = await fetchCarByVin({ token, vin });
 
-    // 2) маркетинг (последние 30 дней)
+    // 2) маркетинг последние 30 дней
     const endDate = toISODate(new Date());
     const startDate = toISODate(addDays(new Date(), -30));
 
@@ -474,6 +478,7 @@ app.get("/check-vin", async (req, res) => {
       ];
 
       const results = await Promise.allSettled(tasks);
+
       const base = results[0].status === "fulfilled" ? results[0].value : null;
 
       const bySource = {};
@@ -497,18 +502,16 @@ app.get("/check-vin", async (req, res) => {
           dealerId: c.dealerId,
         };
       } else {
-        // вот тут теперь будет НОРМАЛЬНОЕ объяснение, если CM вернул HTML
-        const reason =
-          results[0].status === "rejected"
-            ? (results[0].reason?.bodySnippet
-                ? `CM.Expert вернул HTML вместо JSON.\nstatus: ${results[0].reason.status}\ncontent-type: ${results[0].reason.contentType}\n\n${results[0].reason.bodySnippet}`
-                : (results[0].reason?.message || "Ошибка запроса маркетинга"))
-            : "Ошибка запроса маркетинга";
+        const err = results[0].status === "rejected" ? results[0].reason : null;
+        const details =
+          err?.kind === "NON_JSON"
+            ? `CM.Expert ответил HTML вместо JSON.\nstatus: ${err.status}\ncontent-type: ${err.contentType}\nurl: ${err.url}\n\n${err.bodySnippet}`
+            : (err?.message || "Ошибка запроса маркетинга");
 
         marketing = {
           ok: false,
-          message: "Маркетинг недоступен (CM.Expert ответил не JSON)",
-          details: reason,
+          message: "Маркетинг недоступен",
+          details,
           period: { startDate, endDate },
           dealerId: c.dealerId,
         };
@@ -532,7 +535,6 @@ app.get("/check-vin", async (req, res) => {
       })
     );
   } catch (error) {
-    // если CM вернул HTML — вернём это пользователю в message/details
     if (error?.kind === "NON_JSON") {
       return res.status(502).send(
         JSON.stringify({
@@ -540,24 +542,21 @@ app.get("/check-vin", async (req, res) => {
           error: "CM.Expert returned non-JSON",
           status: error.status,
           message: "CM.Expert вернул HTML вместо JSON",
-          details: `content-type: ${error.contentType}\n\n${error.bodySnippet}`,
+          details: `content-type: ${error.contentType}\nurl: ${error.url}\n\n${error.bodySnippet}`,
         })
       );
     }
 
     const status = error?.status || error?.response?.status || 500;
-    const data = error?.response?.data;
-
     return res.status(status).send(
       JSON.stringify({
         ok: false,
         error: "API request failed",
         status,
-        message: data?.message || data?.error || error.message,
+        message: error?.message || "Unknown error",
       })
     );
   }
 });
 
-// Railway-friendly
 app.listen(PORT, "0.0.0.0", () => console.log("Server running on port " + PORT));
